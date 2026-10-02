@@ -41,6 +41,7 @@
 
 # Build directories
 build/
+build-*/
 Build/
 build-*/
 
@@ -49,6 +50,7 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+!Makefile
 install_manifest.txt
 compile_commands.json
 
@@ -67,3 +69,16 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+.venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+benchmark-results*.csv
+
+# Private learning material must remain outside this repository.
+vectorcore-study/
+interview-guide.md
+implementation-report.md
+codex-handoff.md
