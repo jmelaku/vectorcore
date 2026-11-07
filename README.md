@@ -11,6 +11,8 @@ The core does **not** call NumPy, PyTorch, Eigen, or another tensor library. Num
 - stride-based NumPy-style broadcasting without expanded operand copies
 - add, subtract, multiply, divide, negate, sum, mean, ReLU, sigmoid, and rank-2 matrix multiplication
 - dynamic computation graphs and reverse-mode gradients for every operation above
+- PyTorch-style safety: storage version counters reject `backward()` when a tensor saved for the gradient was modified in place (for example by `sgd_step`) after the forward pass
+- leaf-only `.grad` retention with an opt-in `retain_grad()` for intermediates; intermediate gradients are released during the backward pass
 - broadcast-gradient reduction, branched-graph accumulation, repeated backward accumulation, and CPU/Metal transfers in the graph
 - blocked, multithreaded CPU matrix multiplication
 - real Metal buffers and shaders for broadcast elementwise operations, activations, transpose, tree reduction, broadcast-gradient reduction, and tiled matrix multiplication
@@ -93,13 +95,13 @@ The checked run converged linear regression from loss `1.99738` to `6.32e-14` an
 
 ## Tests
 
-`make test` builds and runs both suites. Coverage includes shape errors, scalar and multi-axis broadcasting, invalid broadcast/device/matmul cases, storage sharing, empty reductions, elementwise operations, non-square matmul, activations, graph branching, repeated-backward accumulation, broadcast-gradient reduction, analytical gradients, finite differences, an exact PyTorch gradient comparison, end-to-end training, Metal kernels, CPU/GPU parity, and Metal autograd.
+`make test` builds and runs both suites. Coverage includes a finite-difference gradcheck of every differentiable operation on CPU and Metal (random-projection Jacobian check), in-place-modification detection, leaf-only gradient retention, shape errors, scalar and multi-axis broadcasting, invalid broadcast/device/matmul cases, storage sharing, empty reductions, elementwise operations, non-square matmul, activations, graph branching, repeated-backward accumulation, broadcast-gradient reduction, analytical gradients, finite differences, an exact PyTorch gradient comparison, end-to-end training, Metal kernels, CPU/GPU parity, and Metal autograd.
 
 The final validated run on an Apple M4 passed:
 
-- C++: 15/15 cases
-- Python: 8/8 cases
-- ASan + UBSan C++ run: 15/15 cases (macOS does not provide ASan leak detection)
+- C++: 18/18 cases
+- Python: 62/62 cases
+- ASan + UBSan C++ run: 18/18 cases (macOS does not provide ASan leak detection)
 
 ## Benchmarks
 

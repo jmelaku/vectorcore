@@ -44,6 +44,12 @@ public:
     [[nodiscard]] bool is_contiguous() const;
     [[nodiscard]] bool requires_grad() const;
     void set_requires_grad(bool value);
+    [[nodiscard]] bool is_leaf() const;
+    // Keep .grad on a non-leaf tensor after backward (leaves always keep it).
+    void retain_grad();
+    [[nodiscard]] bool retains_grad() const;
+    // Number of in-place modifications made to this tensor's storage.
+    [[nodiscard]] std::uint64_t version() const;
 
     [[nodiscard]] const float* data() const;
     [[nodiscard]] float* mutable_data();

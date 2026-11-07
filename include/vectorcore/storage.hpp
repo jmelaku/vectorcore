@@ -3,6 +3,7 @@
 #include "vectorcore/device.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 
 namespace vectorcore {
@@ -14,6 +15,15 @@ public:
     [[nodiscard]] virtual std::size_t size() const noexcept = 0;
     [[nodiscard]] virtual const float* data() const;
     [[nodiscard]] virtual float* mutable_data();
+
+    // In-place modification counter shared by every view of this storage.
+    // Autograd records it when saving a tensor for backward and rejects the
+    // backward pass if the value changed in between.
+    [[nodiscard]] std::uint64_t version() const noexcept { return version_; }
+    void bump_version() noexcept { ++version_; }
+
+private:
+    std::uint64_t version_{0};
 };
 
 std::shared_ptr<Storage> make_cpu_storage(std::size_t elements);

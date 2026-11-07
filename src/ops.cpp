@@ -76,9 +76,14 @@ Tensor multiply(const Tensor& a, const Tensor& b) {
     auto output = binary_forward(a, b, cpu::BinaryOp::Multiply);
     const auto a_shape = a.shape();
     const auto b_shape = b.shape();
-    detail::attach_grad_fn(output, {a, b}, [a, b, a_shape, b_shape](const Tensor& gradient) {
-        return std::vector<Tensor>{detail::sum_to_shape(gradient * b, a_shape),
-                                   detail::sum_to_shape(gradient * a, b_shape)};
+    const detail::SavedTensor saved_a(a);
+    const detail::SavedTensor saved_b(b);
+    detail::attach_grad_fn(output, {a, b},
+                           [saved_a, saved_b, a_shape, b_shape](const Tensor& gradient) {
+        const auto av = saved_a.unpack();
+        const auto bv = saved_b.unpack();
+        return std::vector<Tensor>{detail::sum_to_shape(gradient * bv, a_shape),
+                                   detail::sum_to_shape(gradient * av, b_shape)};
     });
     return output;
 }
@@ -87,9 +92,14 @@ Tensor divide(const Tensor& a, const Tensor& b) {
     auto output = binary_forward(a, b, cpu::BinaryOp::Divide);
     const auto a_shape = a.shape();
     const auto b_shape = b.shape();
-    detail::attach_grad_fn(output, {a, b}, [a, b, a_shape, b_shape](const Tensor& gradient) {
-        return std::vector<Tensor>{detail::sum_to_shape(gradient / b, a_shape),
-            detail::sum_to_shape(-(gradient * a) / (b * b), b_shape)};
+    const detail::SavedTensor saved_a(a);
+    const detail::SavedTensor saved_b(b);
+    detail::attach_grad_fn(output, {a, b},
+                           [saved_a, saved_b, a_shape, b_shape](const Tensor& gradient) {
+        const auto av = saved_a.unpack();
+        const auto bv = saved_b.unpack();
+        return std::vector<Tensor>{detail::sum_to_shape(gradient / bv, a_shape),
+            detail::sum_to_shape(-(gradient * av) / (bv * bv), b_shape)};
     });
     return output;
 }
@@ -122,9 +132,11 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
         storage = MetalBackend::instance().matmul(*a.impl()->storage, *b.impl()->storage, m, k, n);
     }
     auto output = detail::make_tensor(std::move(storage), {m, n}, false);
-    detail::attach_grad_fn(output, {a, b}, [a, b](const Tensor& gradient) {
-        return std::vector<Tensor>{gradient.matmul(b.transpose()),
-                                   a.transpose().matmul(gradient)};
+    const detail::SavedTensor saved_a(a);
+    const detail::SavedTensor saved_b(b);
+    detail::attach_grad_fn(output, {a, b}, [saved_a, saved_b](const Tensor& gradient) {
+        return std::vector<Tensor>{gradient.matmul(saved_b.unpack().transpose()),
+                                   saved_a.unpack().transpose().matmul(gradient)};
     });
     return output;
 }
@@ -174,18 +186,20 @@ Tensor mean(const Tensor& value) {
 
 Tensor relu(const Tensor& value) {
     auto output = unary_forward(value, cpu::UnaryOp::Relu);
-    const Tensor saved = value.detach();
+    const detail::SavedTensor saved(value);
     detail::attach_grad_fn(output, {value}, [saved](const Tensor& gradient) {
-        return std::vector<Tensor>{gradient * unary_forward(saved, cpu::UnaryOp::ReluGradient)};
+        return std::vector<Tensor>{
+            gradient * unary_forward(saved.unpack(), cpu::UnaryOp::ReluGradient)};
     });
     return output;
 }
 
 Tensor sigmoid(const Tensor& value) {
     auto output = unary_forward(value, cpu::UnaryOp::Sigmoid);
-    const Tensor saved = output.detach();
+    const detail::SavedTensor saved(output);
     detail::attach_grad_fn(output, {value}, [saved](const Tensor& gradient) {
-        return std::vector<Tensor>{gradient * saved * (1.0F - saved)};
+        const auto y = saved.unpack();
+        return std::vector<Tensor>{gradient * y * (1.0F - y)};
     });
     return output;
 }

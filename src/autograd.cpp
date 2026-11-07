@@ -4,6 +4,7 @@
 #include "vectorcore/ops.hpp"
 
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -16,6 +17,19 @@ NoGradGuard::~NoGradGuard() { enabled = previous_; }
 bool grad_enabled() { return enabled; }
 
 namespace detail {
+
+SavedTensor::SavedTensor(const Tensor& value)
+    : tensor_(value.detach()), version_(value.version()) {}
+
+Tensor SavedTensor::unpack() const {
+    if (tensor_.version() != version_) {
+        throw std::runtime_error(
+            "a tensor needed for gradient computation was modified in place after it was "
+            "used (saved version " + std::to_string(version_) + ", current version " +
+            std::to_string(tensor_.version()) + "); run backward() before mutating it");
+    }
+    return tensor_;
+}
 
 void attach_grad_fn(Tensor& output, const std::vector<Tensor>& parents,
                     std::function<std::vector<Tensor>(const Tensor&)> backward_fn) {

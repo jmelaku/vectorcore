@@ -95,6 +95,16 @@ Device Tensor::device() const { return impl_->storage->device(); }
 DType Tensor::dtype() const { return impl_->dtype; }
 bool Tensor::is_contiguous() const { return vectorcore::is_contiguous(shape(), strides()); }
 bool Tensor::requires_grad() const { return impl_->requires_grad; }
+bool Tensor::is_leaf() const { return impl_->leaf; }
+bool Tensor::retains_grad() const { return impl_->retains_grad; }
+std::uint64_t Tensor::version() const { return impl_->storage->version(); }
+
+void Tensor::retain_grad() {
+    if (!impl_->requires_grad) {
+        throw std::runtime_error("retain_grad() requires a tensor that requires gradients");
+    }
+    if (!impl_->leaf) impl_->retains_grad = true;
+}
 
 void Tensor::set_requires_grad(bool value) {
     if (!impl_->leaf) throw std::runtime_error("requires_grad can only be changed on leaf tensors");
@@ -113,6 +123,8 @@ float* Tensor::mutable_data() {
     if (device() != Device::cpu()) {
         throw std::runtime_error("mutable_data() is only valid for CPU tensors; use to(CPU)");
     }
+    // Handing out a writable pointer counts as an in-place modification.
+    impl_->storage->bump_version();
     return impl_->storage->mutable_data() + impl_->offset;
 }
 
@@ -249,7 +261,12 @@ void Tensor::backward(const Tensor& gradient) const {
         const auto found = gradients.find(node.get());
         if (found == gradients.end()) continue;
         const Tensor upstream = found->second;
-        if (node->requires_grad) {
+        // Release the accumulated gradient as soon as it has been consumed so
+        // intermediate gradients do not all stay alive until the pass ends.
+        gradients.erase(found);
+        // Only leaves (parameters/inputs) keep .grad, matching PyTorch;
+        // intermediates opt in with retain_grad().
+        if (node->requires_grad && (node->leaf || node->retains_grad)) {
             if (node->grad) {
                 node->grad = (detail::from_impl(node->grad) + upstream).detach().impl();
             } else {

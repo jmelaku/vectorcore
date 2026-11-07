@@ -216,6 +216,51 @@ int main() {
         close(gb.grad().to(Device::cpu()), {0, 2, 2});
     });
 
+    test("version counter is shared by views and bumped by writes", [] {
+        Tensor value({1, 2, 3, 4}, {2, 2});
+        auto view = value.reshape({4});
+        const auto start = value.version();
+        (void)(value + value);
+        check(value.version() == start, "out-of-place op bumped the version");
+        view.set_at({0}, 5.0F);
+        check(value.version() == start + 1, "write did not bump the version");
+        check(view.version() == value.version(), "views do not share a version");
+    });
+
+    test("in-place update between forward and backward is rejected", [] {
+        Tensor w({2.0F}, {1}, true);
+        Tensor x({3.0F}, {1}, true);
+        auto loss = (w * x).sum();
+        w.set_at({0}, 1.0F);
+        throws([&] { loss.backward(); });
+
+        Tensor a({1, 2, 3, 4}, {2, 2}, true);
+        Tensor b({1, 0, 0, 1}, {2, 2}, true);
+        auto product = a.matmul(b).sum();
+        (b * 1.0F).sum().backward();  // give b a gradient so sgd_step writes to it
+        nn::sgd_step({&b}, 0.0F);     // any optimizer step counts as a write
+        throws([&] { product.backward(); });
+
+        Tensor s({0.5F, -0.5F}, {2}, true);
+        auto y = s.sigmoid();
+        auto sigmoid_loss = y.sum();
+        y.detach().set_at({0}, 0.0F);  // corrupts sigmoid's saved output
+        throws([&] { sigmoid_loss.backward(); });
+    });
+
+    test("only leaves keep gradients unless retain_grad is used", [] {
+        Tensor a({1, 2}, {2}, true);
+        auto hidden = a * 2.0F;
+        auto kept = a * 3.0F;
+        kept.retain_grad();
+        ((hidden * hidden).sum() + kept.sum()).backward();
+        check(a.is_leaf() && !hidden.is_leaf(), "leaf flags wrong");
+        check(!hidden.has_grad(), "intermediate kept a gradient");
+        close(kept.grad(), {1, 1});
+        close(a.grad(), {8 + 3, 16 + 3});
+        throws([] { Tensor({1.0F}, {1}).retain_grad(); });
+    });
+
     std::cout << tests - failures << "/" << tests << " tests passed\n";
     return failures == 0 ? 0 : 1;
 }

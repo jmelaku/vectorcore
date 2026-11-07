@@ -72,6 +72,10 @@ PYBIND11_MODULE(vectorcore, module) {
         .def_property_readonly("device", [](const Tensor& value) { return value.device().str(); })
         .def_property_readonly("dtype", [](const Tensor&) { return "float32"; })
         .def_property("requires_grad", &Tensor::requires_grad, &Tensor::set_requires_grad)
+        .def_property_readonly("is_leaf", &Tensor::is_leaf)
+        .def_property_readonly("retains_grad", &Tensor::retains_grad)
+        .def_property_readonly("_version", &Tensor::version)
+        .def("retain_grad", &Tensor::retain_grad)
         .def_property_readonly("grad", [](const Tensor& value) -> py::object {
             return value.has_grad() ? py::cast(value.grad()) : py::none();
         })

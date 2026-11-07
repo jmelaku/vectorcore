@@ -25,8 +25,21 @@ struct TensorImpl {
     DType dtype{DType::Float32};
     bool requires_grad{false};
     bool leaf{true};
+    bool retains_grad{false};
     std::shared_ptr<GradFn> grad_fn;
     std::shared_ptr<TensorImpl> grad;
+};
+
+// A tensor captured for use in a backward rule, together with the storage
+// version at capture time. unpack() throws if the storage was modified in place
+// afterwards, since the gradient would otherwise be computed from new values.
+class SavedTensor {
+public:
+    explicit SavedTensor(const Tensor& value);
+    [[nodiscard]] Tensor unpack() const;
+private:
+    Tensor tensor_;
+    std::uint64_t version_;
 };
 
 Tensor from_impl(std::shared_ptr<TensorImpl> impl);
