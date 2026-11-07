@@ -66,6 +66,15 @@ public:
     [[nodiscard]] Tensor mean() const;
     [[nodiscard]] Tensor relu() const;
     [[nodiscard]] Tensor sigmoid() const;
+    [[nodiscard]] Tensor exp() const;
+    [[nodiscard]] Tensor log() const;
+    [[nodiscard]] Tensor sum(std::int64_t axis, bool keepdim = false) const;
+    [[nodiscard]] Tensor mean(std::int64_t axis, bool keepdim = false) const;
+    [[nodiscard]] Tensor max() const;
+    [[nodiscard]] Tensor max(std::int64_t axis, bool keepdim = false) const;
+    [[nodiscard]] Tensor argmax(std::int64_t axis, bool keepdim = false) const;
+    [[nodiscard]] Tensor softmax(std::int64_t axis = -1) const;
+    [[nodiscard]] Tensor log_softmax(std::int64_t axis = -1) const;
     [[nodiscard]] Tensor matmul(const Tensor& other) const;
     [[nodiscard]] Tensor detach() const;
 

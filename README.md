@@ -9,15 +9,18 @@ The core does **not** call NumPy, PyTorch, Eigen, or another tensor library. Num
 - float32 scalar, vector, matrix, and higher-rank tensors
 - checked shapes, contiguous strides, indexing, reshape/flatten views, and 2-D transpose
 - stride-based NumPy-style broadcasting without expanded operand copies
-- add, subtract, multiply, divide, negate, sum, mean, ReLU, sigmoid, and rank-2 matrix multiplication
+- add, subtract, multiply, divide, negate, exp, log, ReLU, sigmoid
+- reductions over all elements or along one axis (with `keepdim`): sum, mean, max, and non-differentiable argmax
+- numerically stable softmax / log-softmax along any axis, and softmax cross-entropy with integer class targets
+- batched matrix multiplication with NumPy-style broadcasting of batch dimensions, and batched last-two-axis transpose
 - dynamic computation graphs and reverse-mode gradients for every operation above
 - PyTorch-style safety: storage version counters reject `backward()` when a tensor saved for the gradient was modified in place (for example by `sgd_step`) after the forward pass
 - leaf-only `.grad` retention with an opt-in `retain_grad()` for intermediates; intermediate gradients are released during the backward pass
 - broadcast-gradient reduction, branched-graph accumulation, repeated backward accumulation, and CPU/Metal transfers in the graph
 - blocked, multithreaded CPU matrix multiplication
 - real Metal buffers and shaders for broadcast elementwise operations, activations, transpose, tree reduction, broadcast-gradient reduction, and tiled matrix multiplication
-- Python `Tensor`, `Linear`, MSE loss, and SGD interfaces
-- deterministic linear-regression and two-layer-network training examples
+- Python `Tensor`, `Linear`, MSE and cross-entropy losses, and SGD on both CPU and Metal parameters
+- deterministic linear-regression, two-layer-network, and spiral-classifier training examples
 
 ## Architecture
 
@@ -83,6 +86,12 @@ b = vc.Tensor([[5, 6], [7, 8]], requires_grad=True)
 loss = (a @ b).sum()
 loss.backward()
 print(a.grad.numpy())
+
+# classification
+logits = vc.Tensor([[2.0, 0.5, -1.0], [0.1, 0.2, 3.0]], requires_grad=True)
+loss = vc.cross_entropy(logits, [0, 2])
+loss.backward()
+print(logits.softmax(-1).numpy(), logits.argmax(1).numpy())
 ```
 
 Run both training examples with:
@@ -91,17 +100,17 @@ Run both training examples with:
 make example
 ```
 
-The checked run converged linear regression from loss `1.99738` to `6.32e-14` and learned weight `2`, bias `1`. The two-layer example reduced loss from `0.246688` to `0.005123` in 400 SGD steps.
+The checked run converged linear regression from loss `1.99738` to `6.32e-14` and learned weight `2`, bias `1`. The two-layer example reduced loss from `0.246688` to `0.005123` in 400 SGD steps. The spiral classifier (`examples/spiral_classifier.py`, three interleaved non-linearly-separable arms, 64 hidden units) reached 100% held-out accuracy in 1000 steps on both CPU (0.29 s) and Metal (14.6 s, identical loss curve); the Metal time is dominated by per-operation synchronous dispatch, see Known limitations.
 
 ## Tests
 
-`make test` builds and runs both suites. Coverage includes a finite-difference gradcheck of every differentiable operation on CPU and Metal (random-projection Jacobian check), in-place-modification detection, leaf-only gradient retention, shape errors, scalar and multi-axis broadcasting, invalid broadcast/device/matmul cases, storage sharing, empty reductions, elementwise operations, non-square matmul, activations, graph branching, repeated-backward accumulation, broadcast-gradient reduction, analytical gradients, finite differences, an exact PyTorch gradient comparison, end-to-end training, Metal kernels, CPU/GPU parity, and Metal autograd.
+`make test` builds and runs both suites. Coverage includes a finite-difference gradcheck of every differentiable operation (including axis reductions, softmax, cross-entropy and batched/broadcast matmul) on CPU and Metal, forward parity against NumPy and PyTorch for the classification ops, softmax stability at extreme logits (random-projection Jacobian check), in-place-modification detection, leaf-only gradient retention, shape errors, scalar and multi-axis broadcasting, invalid broadcast/device/matmul cases, storage sharing, empty reductions, elementwise operations, non-square matmul, activations, graph branching, repeated-backward accumulation, broadcast-gradient reduction, analytical gradients, finite differences, an exact PyTorch gradient comparison, end-to-end training, Metal kernels, CPU/GPU parity, and Metal autograd.
 
 The final validated run on an Apple M4 passed:
 
-- C++: 18/18 cases
-- Python: 62/62 cases
-- ASan + UBSan C++ run: 18/18 cases (macOS does not provide ASan leak detection)
+- C++: 22/22 cases
+- Python: 155/155 cases
+- ASan + UBSan C++ run: 22/22 cases (macOS does not provide ASan leak detection)
 
 ## Benchmarks
 
@@ -135,12 +144,12 @@ VectorCore is not faster than optimized vendor libraries. Its scalar broadcast i
 ## Known limitations
 
 - float32 is the only dtype.
-- matrix multiplication and transpose are rank-2; batched GEMM is not implemented.
-- reductions currently reduce all elements rather than accepting axes.
+- reductions accept a single axis (or all axes), not a tuple of axes.
+- `transpose` swaps the last two axes; there is no general axis permutation.
 - all operation outputs are contiguous; only reshape is a shared-storage view.
-- Metal calls are synchronous, without command fusion, allocator pooling, or asynchronous streams.
+- Metal calls are synchronous, without command fusion, allocator pooling, or asynchronous streams. Small-model training is therefore far slower on Metal than on CPU (the spiral example: ~50x), because every operation waits for its own command buffer.
 - Metal broadcast-gradient reduction favors portability and correctness over speed (one thread per target element).
-- SGD mutation is CPU-only; Metal forward/backward works, but an optimizer step requires an explicit CPU transfer.
+- SGD is the only optimizer (no momentum or Adam yet).
 - graphs are retained as long as output tensors reference them; there is no `retain_graph`/early-release API.
 
 These constraints are explicit—the runtime does not claim unsupported kernels ran on the GPU.

@@ -27,6 +27,13 @@ def positive(rng, shape):
     return uniform(rng, shape, 1.0, 2.0)
 
 
+def well_separated(rng, shape):
+    """Distinct values at least 0.1 apart, so a finite-difference step can
+    never change which element is the maximum."""
+    count = int(np.prod(shape))
+    return (rng.permutation(count) * 0.1 - count * 0.05).reshape(shape).astype(np.float32)
+
+
 def signed_permutation(rng, size):
     """A signed permutation matrix plus small noise. Multiplying an
     away_from_zero input by it keeps every hidden pre-activation at least ~0.17
@@ -107,6 +114,32 @@ CASES = [
                                             ((x @ w1).relu() @ w2 - y)).mean(),
      [lambda r: away_from_zero(r, (4, 3)), lambda r: signed_permutation(r, 3),
       lambda r: uniform(r, (3, 1)), lambda r: uniform(r, (4, 1))]),
+    # --- classifier building blocks ---
+    ("exp", lambda a: a.exp(), [lambda r: uniform(r, (2, 3))]),
+    ("log", lambda a: a.log(), [lambda r: positive(r, (2, 3))]),
+    ("sum_axis0", lambda a: a.sum(0), [lambda r: uniform(r, (3, 4))]),
+    ("sum_axis_neg1_keepdim", lambda a: a.sum(-1, keepdim=True) * a,
+     [lambda r: uniform(r, (2, 3, 4))]),
+    ("mean_axis1", lambda a: a.mean(1), [lambda r: uniform(r, (2, 3, 4))]),
+    ("max_axis1", lambda a: a.max(1), [lambda r: well_separated(r, (3, 4))]),
+    ("max_axis0_keepdim", lambda a: a.max(0, keepdim=True) * a,
+     [lambda r: well_separated(r, (3, 4))]),
+    ("max_all", lambda a: a.max(), [lambda r: well_separated(r, (2, 3))]),
+    ("softmax_rows", lambda a: a.softmax(-1), [lambda r: uniform(r, (3, 4), -2, 2)]),
+    ("softmax_axis0", lambda a: a.softmax(0), [lambda r: uniform(r, (3, 4), -2, 2)]),
+    ("log_softmax_rows", lambda a: a.log_softmax(1), [lambda r: uniform(r, (3, 4), -2, 2)]),
+    ("cross_entropy", lambda a: vc.cross_entropy(a, [2, 0, 3]),
+     [lambda r: uniform(r, (3, 4), -2, 2)]),
+    ("batched_matmul", lambda a, b: a @ b,
+     [lambda r: uniform(r, (2, 3, 4)), lambda r: uniform(r, (2, 4, 2))]),
+    ("batched_matmul_broadcast_rhs", lambda a, b: a @ b,
+     [lambda r: uniform(r, (2, 3, 4)), lambda r: uniform(r, (4, 2))]),
+    ("batched_matmul_broadcast_both", lambda a, b: a @ b,
+     [lambda r: uniform(r, (2, 1, 3, 4)), lambda r: uniform(r, (3, 4, 2))]),
+    ("transpose_rank3", lambda a: a.transpose(), [lambda r: uniform(r, (2, 3, 4))]),
+    ("mlp_classifier", lambda x, w1, w2: vc.cross_entropy((x @ w1).relu() @ w2, [0, 2, 1, 2]),
+     [lambda r: away_from_zero(r, (4, 3)), lambda r: signed_permutation(r, 3),
+      lambda r: uniform(r, (3, 3))]),
 ]
 
 

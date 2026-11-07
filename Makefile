@@ -29,6 +29,7 @@ benchmark: build
 example: build
 	$(BUILD)/linear_regression
 	PYTHONPATH=$(BUILD) $(PYTHON) examples/two_layer.py
+	PYTHONPATH=$(BUILD) $(PYTHON) examples/spiral_classifier.py
 
 clean:
 	$(CMAKE) -E remove_directory $(BUILD)

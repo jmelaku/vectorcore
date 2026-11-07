@@ -26,6 +26,16 @@ Every `Storage` carries a version counter shared by all views of it. `Tensor::mu
 
 Backward rules are built from native VectorCore operations: matrix multiplication uses `dA = dY @ B.T` and `dB = A.T @ dY`; sigmoid saves a detached output; ReLU saves a detached input and computes its mask on the active device; reshape restores the source shape; device transfer moves the gradient back to its source device.
 
+## Reductions, softmax and classification
+
+Axis reductions view a contiguous tensor as `[outer, length, inner]` around the reduced axis and produce `[outer, inner]`; `keepdim` only changes the reported shape. CPU kernels accumulate sums in double precision; Metal runs one thread per output element. `max` also records an argmax (first index wins ties) and its backward rule scatters the upstream gradient to that single position, matching PyTorch's `max(dim)`. `sum` backward broadcasts the gradient back with a keepdim-shaped reshape.
+
+`log_softmax(x) = (x - m) - log(sum(exp(x - m)))` with `m = max(x.detach())`. Because log-softmax is invariant to subtracting a per-row constant, treating `m` as a constant keeps the gradient exact while preventing `exp` overflow. `softmax` is `exp(log_softmax)`. `cross_entropy` builds a one-hot mask from the integer targets on the logits' device and returns `-(log_softmax(logits) * mask).sum() / batch`, so its gradient is composed entirely from verified primitives.
+
+Matrix multiplication treats all but the last two axes as batch dimensions that broadcast like elementwise operands. The forward pass computes, per output batch, the element offsets of the A and B matrices it reads, so a broadcast operand is reused rather than copied; Metal receives these offsets in a buffer indexed by the threadgroup's z coordinate. In backward, `dA = dY @ B^T` and `dB = A^T @ dY` are batched products whose results are reduced with `sum_to_shape` back to each operand's original (possibly un-batched) shape.
+
+`sgd_step` updates CPU parameters through `mutable_data()` and Metal parameters through an in-place `axpy` kernel; both bump the storage version, so stale graphs are still rejected.
+
 ## Metal execution
 
 The build embeds `metal/kernels.metal` into the library. `MetalBackend` obtains the default device, creates one command queue, compiles the MSL source with `newLibraryWithSource`, and caches all compute pipeline states. Failure leaves the backend unavailable with a diagnostic. There is no CPU fallback inside Metal operations.

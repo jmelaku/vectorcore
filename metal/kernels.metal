@@ -58,7 +58,9 @@ kernel void unary(const device float* input [[buffer(0)]],
         case 0: output[gid] = -value; break;
         case 1: output[gid] = max(value, 0.0f); break;
         case 2: output[gid] = 1.0f / (1.0f + exp(-value)); break;
-        default: output[gid] = value > 0.0f ? 1.0f : 0.0f; break;
+        case 3: output[gid] = value > 0.0f ? 1.0f : 0.0f; break;
+        case 4: output[gid] = exp(value); break;
+        default: output[gid] = log(value); break;
     }
 }
 
@@ -101,37 +103,47 @@ kernel void reduce_to_shape(const device float* input [[buffer(0)]],
 
 constant uint TILE = 16;
 
+// Batched tiled GEMM. Threadgroup z selects the batch; offsets[z] holds the
+// element offsets of that batch's A and B matrices, which lets broadcast batch
+// dimensions reuse one operand without copying it.
 kernel void matmul_tiled(const device float* a [[buffer(0)]],
                          const device float* b [[buffer(1)]],
                          device float* output [[buffer(2)]],
                          constant uint& m [[buffer(3)]],
                          constant uint& k [[buffer(4)]],
                          constant uint& n [[buffer(5)]],
-                         ushort2 tid [[thread_position_in_threadgroup]],
-                         uint2 gid [[thread_position_in_grid]]) {
+                         const device uint2* offsets [[buffer(6)]],
+                         uint3 tid [[thread_position_in_threadgroup]],
+                         uint3 gid [[thread_position_in_grid]]) {
     threadgroup float tile_a[16][16];
     threadgroup float tile_b[16][16];
+    const device float* batch_a = a + offsets[gid.z].x;
+    const device float* batch_b = b + offsets[gid.z].y;
     float accumulator = 0.0f;
     for (uint tile = 0; tile < (k + TILE - 1) / TILE; ++tile) {
         uint a_col = tile * TILE + tid.x;
         uint b_row = tile * TILE + tid.y;
-        tile_a[tid.y][tid.x] = gid.y < m && a_col < k ? a[gid.y * k + a_col] : 0.0f;
-        tile_b[tid.y][tid.x] = b_row < k && gid.x < n ? b[b_row * n + gid.x] : 0.0f;
+        tile_a[tid.y][tid.x] = gid.y < m && a_col < k ? batch_a[gid.y * k + a_col] : 0.0f;
+        tile_b[tid.y][tid.x] = b_row < k && gid.x < n ? batch_b[b_row * n + gid.x] : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint inner = 0; inner < TILE; ++inner) {
             accumulator += tile_a[tid.y][inner] * tile_b[inner][tid.x];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (gid.y < m && gid.x < n) output[gid.y * n + gid.x] = accumulator;
+    if (gid.y < m && gid.x < n) output[gid.z * m * n + gid.y * n + gid.x] = accumulator;
 }
 
+// Swaps the last two axes of a contiguous [batch, rows, cols] tensor.
 kernel void transpose_2d(const device float* input [[buffer(0)]],
                          device float* output [[buffer(1)]],
                          constant uint& rows [[buffer(2)]],
                          constant uint& cols [[buffer(3)]],
-                         uint2 gid [[thread_position_in_grid]]) {
-    if (gid.y < rows && gid.x < cols) output[gid.x * rows + gid.y] = input[gid.y * cols + gid.x];
+                         uint3 gid [[thread_position_in_grid]]) {
+    if (gid.y < rows && gid.x < cols) {
+        uint base = gid.z * rows * cols;
+        output[base + gid.x * rows + gid.y] = input[base + gid.y * cols + gid.x];
+    }
 }
 
 kernel void reduce_sum_pass(const device float* input [[buffer(0)]],
@@ -148,4 +160,62 @@ kernel void reduce_sum_pass(const device float* input [[buffer(0)]],
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if (tid == 0) output[group] = scratch[0];
+}
+
+struct AxisMeta {
+    uint outer;
+    uint length;
+    uint inner;
+    uint operation;  // 0 sum, 1 max, 2 argmax
+};
+
+// One thread per [outer, inner] output; walks the reduced axis sequentially.
+kernel void reduce_axis(const device float* input [[buffer(0)]],
+                        device float* output [[buffer(1)]],
+                        constant AxisMeta& meta [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]]) {
+    if (gid >= meta.outer * meta.inner) return;
+    uint o = gid / meta.inner;
+    uint i = gid % meta.inner;
+    const device float* base = input + o * meta.length * meta.inner + i;
+    if (meta.operation == 0) {
+        float total = 0.0f;
+        for (uint a = 0; a < meta.length; ++a) total += base[a * meta.inner];
+        output[gid] = total;
+        return;
+    }
+    uint best = 0;
+    float best_value = base[0];
+    for (uint a = 1; a < meta.length; ++a) {
+        float value = base[a * meta.inner];
+        if (value > best_value) {
+            best_value = value;
+            best = a;
+        }
+    }
+    output[gid] = meta.operation == 1 ? best_value : float(best);
+}
+
+// One thread per full-size output element: it receives the upstream value only
+// if its position along the axis is the recorded argmax.
+kernel void scatter_axis(const device float* values [[buffer(0)]],
+                         const device float* indices [[buffer(1)]],
+                         device float* output [[buffer(2)]],
+                         constant AxisMeta& meta [[buffer(3)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= meta.outer * meta.length * meta.inner) return;
+    uint i = gid % meta.inner;
+    uint a = (gid / meta.inner) % meta.length;
+    uint o = gid / (meta.inner * meta.length);
+    uint reduced = o * meta.inner + i;
+    output[gid] = uint(indices[reduced]) == a ? values[reduced] : 0.0f;
+}
+
+// target += alpha * source, in place (used by the optimizer).
+kernel void axpy_inplace(device float* target [[buffer(0)]],
+                         const device float* source [[buffer(1)]],
+                         constant float& alpha [[buffer(2)]],
+                         constant uint& count [[buffer(3)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid < count) target[gid] += alpha * source[gid];
 }

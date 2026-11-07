@@ -211,6 +211,15 @@ Tensor Tensor::sum() const { return vectorcore::sum(*this); }
 Tensor Tensor::mean() const { return vectorcore::mean(*this); }
 Tensor Tensor::relu() const { return vectorcore::relu(*this); }
 Tensor Tensor::sigmoid() const { return vectorcore::sigmoid(*this); }
+Tensor Tensor::exp() const { return vectorcore::exp(*this); }
+Tensor Tensor::log() const { return vectorcore::log(*this); }
+Tensor Tensor::sum(std::int64_t axis, bool keepdim) const { return vectorcore::sum(*this, axis, keepdim); }
+Tensor Tensor::mean(std::int64_t axis, bool keepdim) const { return vectorcore::mean(*this, axis, keepdim); }
+Tensor Tensor::max() const { return vectorcore::max(*this); }
+Tensor Tensor::max(std::int64_t axis, bool keepdim) const { return vectorcore::max(*this, axis, keepdim); }
+Tensor Tensor::argmax(std::int64_t axis, bool keepdim) const { return vectorcore::argmax(*this, axis, keepdim); }
+Tensor Tensor::softmax(std::int64_t axis) const { return vectorcore::softmax(*this, axis); }
+Tensor Tensor::log_softmax(std::int64_t axis) const { return vectorcore::log_softmax(*this, axis); }
 Tensor Tensor::matmul(const Tensor& other) const { return vectorcore::matmul(*this, other); }
 
 Tensor Tensor::detach() const {

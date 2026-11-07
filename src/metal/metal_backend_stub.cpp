@@ -15,11 +15,17 @@ public:
     std::shared_ptr<Storage> binary(const Storage&, const Shape&, const Strides&,
         const Storage&, const Shape&, const Strides&, const Shape&, cpu::BinaryOp) override { fail(); }
     std::shared_ptr<Storage> unary(const Storage&, std::size_t, cpu::UnaryOp) override { fail(); }
-    std::shared_ptr<Storage> matmul(const Storage&, const Storage&, std::size_t,
-        std::size_t, std::size_t) override { fail(); }
-    std::shared_ptr<Storage> transpose2d(const Storage&, std::size_t, std::size_t) override { fail(); }
+    std::shared_ptr<Storage> matmul(const Storage&, const Storage&, std::size_t, std::size_t,
+        std::size_t, const std::vector<std::size_t>&, const std::vector<std::size_t>&) override { fail(); }
+    std::shared_ptr<Storage> transpose_last2(const Storage&, std::size_t, std::size_t,
+        std::size_t) override { fail(); }
     std::shared_ptr<Storage> reduce_sum(const Storage&, std::size_t) override { fail(); }
     std::shared_ptr<Storage> reduce_to_shape(const Storage&, const Shape&, const Shape&) override { fail(); }
+    std::shared_ptr<Storage> reduce_axis(const Storage&, std::size_t, std::size_t, std::size_t,
+        cpu::ReduceOp) override { fail(); }
+    std::shared_ptr<Storage> scatter_axis(const Storage&, const Storage&, std::size_t,
+        std::size_t, std::size_t) override { fail(); }
+    void axpy_inplace(Storage&, const Storage&, std::size_t, float) override { fail(); }
     void synchronize() override {}
 private:
     [[noreturn]] static void fail() { throw std::runtime_error("Metal backend is unavailable"); }

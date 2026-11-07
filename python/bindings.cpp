@@ -5,7 +5,9 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -44,6 +46,16 @@ py::array_t<float> tensor_numpy(const Tensor& tensor) {
     py::array_t<float> output(shape);
     std::memcpy(output.mutable_data(), values.data(), values.size() * sizeof(float));
     return output;
+}
+
+// Python-style reduction: axis=None reduces everything; keepdim then keeps
+// every axis with size 1.
+template <typename All, typename Axis>
+Tensor reduce_all_or_axis(const Tensor& value, std::optional<std::int64_t> axis, bool keepdim,
+                          All all, Axis along) {
+    if (axis) return along(value, *axis, keepdim);
+    auto result = all(value);
+    return keepdim ? result.reshape(Shape(value.ndim(), 1)) : result;
 }
 
 } // namespace
@@ -86,10 +98,32 @@ PYBIND11_MODULE(vectorcore, module) {
         .def("flatten", &Tensor::flatten)
         .def("transpose", &Tensor::transpose)
         .def_property_readonly("T", &Tensor::transpose)
-        .def("sum", &Tensor::sum)
-        .def("mean", &Tensor::mean)
+        .def("sum", [](const Tensor& t, std::optional<std::int64_t> axis, bool keepdim) {
+            return reduce_all_or_axis(t, axis, keepdim,
+                [](const Tensor& x) { return x.sum(); },
+                [](const Tensor& x, std::int64_t a, bool k) { return x.sum(a, k); });
+        }, py::arg("axis") = py::none(), py::arg("keepdim") = false)
+        .def("mean", [](const Tensor& t, std::optional<std::int64_t> axis, bool keepdim) {
+            return reduce_all_or_axis(t, axis, keepdim,
+                [](const Tensor& x) { return x.mean(); },
+                [](const Tensor& x, std::int64_t a, bool k) { return x.mean(a, k); });
+        }, py::arg("axis") = py::none(), py::arg("keepdim") = false)
+        .def("max", [](const Tensor& t, std::optional<std::int64_t> axis, bool keepdim) {
+            return reduce_all_or_axis(t, axis, keepdim,
+                [](const Tensor& x) { return x.max(); },
+                [](const Tensor& x, std::int64_t a, bool k) { return x.max(a, k); });
+        }, py::arg("axis") = py::none(), py::arg("keepdim") = false)
+        .def("argmax", [](const Tensor& t, std::optional<std::int64_t> axis, bool keepdim) {
+            if (axis) return t.argmax(*axis, keepdim);
+            auto flat = t.flatten().argmax(0, false);
+            return keepdim ? flat.reshape(Shape(t.ndim(), 1)) : flat;
+        }, py::arg("axis") = py::none(), py::arg("keepdim") = false)
         .def("relu", &Tensor::relu)
         .def("sigmoid", &Tensor::sigmoid)
+        .def("exp", py::overload_cast<>(&Tensor::exp, py::const_))
+        .def("log", py::overload_cast<>(&Tensor::log, py::const_))
+        .def("softmax", &Tensor::softmax, py::arg("axis") = -1)
+        .def("log_softmax", &Tensor::log_softmax, py::arg("axis") = -1)
         .def("matmul", &Tensor::matmul)
         .def("to", [](const Tensor& value, const std::string& device) {
             return value.to(parse_device(device));
@@ -122,6 +156,12 @@ PYBIND11_MODULE(vectorcore, module) {
         .def_readwrite("bias", &nn::Linear::bias);
 
     module.def("mse_loss", &nn::mse_loss);
+    module.def("cross_entropy", &nn::cross_entropy, py::arg("logits"), py::arg("targets"),
+               "Mean softmax cross-entropy of [batch, classes] logits and integer class targets.");
+    module.def("softmax", [](const Tensor& t, std::int64_t axis) { return t.softmax(axis); },
+               py::arg("value"), py::arg("axis") = -1);
+    module.def("log_softmax", [](const Tensor& t, std::int64_t axis) { return t.log_softmax(axis); },
+               py::arg("value"), py::arg("axis") = -1);
     module.def("sgd_step", [](std::vector<Tensor> parameters, float learning_rate) {
         std::vector<Tensor*> pointers;
         for (auto& parameter : parameters) pointers.push_back(&parameter);

@@ -11,6 +11,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace vectorcore {
 
@@ -48,6 +49,13 @@ struct BroadcastMeta {
     std::uint32_t a_stride[8]{};
     std::uint32_t b_shape[8]{};
     std::uint32_t b_stride[8]{};
+};
+
+struct AxisMeta {
+    std::uint32_t outer;
+    std::uint32_t length;
+    std::uint32_t inner;
+    std::uint32_t operation;
 };
 
 struct ReduceShapeMeta {
@@ -95,8 +103,12 @@ public:
             transpose_pipeline_ = pipeline(@"transpose_2d");
             reduce_pipeline_ = pipeline(@"reduce_sum_pass");
             reduce_shape_pipeline_ = pipeline(@"reduce_to_shape");
+            reduce_axis_pipeline_ = pipeline(@"reduce_axis");
+            scatter_axis_pipeline_ = pipeline(@"scatter_axis");
+            axpy_pipeline_ = pipeline(@"axpy_inplace");
             ready_ = binary_pipeline_ && unary_pipeline_ && matmul_pipeline_ &&
-                     transpose_pipeline_ && reduce_pipeline_ && reduce_shape_pipeline_;
+                     transpose_pipeline_ && reduce_pipeline_ && reduce_shape_pipeline_ &&
+                     reduce_axis_pipeline_ && scatter_axis_pipeline_ && axpy_pipeline_;
             if (!ready_ && error_.empty()) error_ = "one or more Metal pipelines failed to initialize";
         }
     }
@@ -174,12 +186,28 @@ public:
     }
 
     std::shared_ptr<Storage> matmul(const Storage& a, const Storage& b,
-                                    std::size_t m_size, std::size_t k_size,
-                                    std::size_t n_size) override {
-        auto output = allocate(m_size * n_size);
+                                    std::size_t m_size, std::size_t k_size, std::size_t n_size,
+                                    const std::vector<std::size_t>& a_offsets,
+                                    const std::vector<std::size_t>& b_offsets) override {
+        if (a_offsets.size() != b_offsets.size() || a_offsets.empty()) {
+            throw std::invalid_argument("Metal matmul needs one A and B offset per batch");
+        }
+        const auto batch = a_offsets.size();
+        auto output = allocate(batch * m_size * n_size);
+        if (batch * m_size * n_size == 0) return output;
+        (void)checked_u32(batch * m_size * n_size, "matmul output size");
         const auto m = checked_u32(m_size, "matrix dimension");
         const auto k = checked_u32(k_size, "matrix dimension");
         const auto n = checked_u32(n_size, "matrix dimension");
+        std::vector<std::uint32_t> offsets(batch * 2);
+        for (std::size_t z = 0; z < batch; ++z) {
+            offsets[2 * z] = checked_u32(a_offsets[z], "matmul offset");
+            offsets[2 * z + 1] = checked_u32(b_offsets[z], "matmul offset");
+        }
+        id<MTLBuffer> offset_buffer = [device_ newBufferWithBytes:offsets.data()
+                                                           length:offsets.size() * sizeof(std::uint32_t)
+                                                          options:MTLResourceStorageModeShared];
+        if (!offset_buffer) throw std::runtime_error("Metal buffer allocation failed");
         submit([&](id<MTLComputeCommandEncoder> encoder) {
             [encoder setComputePipelineState:matmul_pipeline_];
             [encoder setBuffer:as_metal(a).buffer() offset:0 atIndex:0];
@@ -188,18 +216,22 @@ public:
             [encoder setBytes:&m length:sizeof(m) atIndex:3];
             [encoder setBytes:&k length:sizeof(k) atIndex:4];
             [encoder setBytes:&n length:sizeof(n) atIndex:5];
+            [encoder setBuffer:offset_buffer offset:0 atIndex:6];
             // Launch complete tiles: even edge outputs need all 16 lanes to
             // cooperatively load K-dimension values into threadgroup memory.
             [encoder dispatchThreadgroups:MTLSizeMake((n_size + 15) / 16,
-                                                       (m_size + 15) / 16, 1)
+                                                       (m_size + 15) / 16, batch)
                  threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
         });
         return output;
     }
 
-    std::shared_ptr<Storage> transpose2d(const Storage& input, std::size_t rows_size,
-                                         std::size_t cols_size) override {
-        auto output = allocate(rows_size * cols_size);
+    std::shared_ptr<Storage> transpose_last2(const Storage& input, std::size_t batch,
+                                             std::size_t rows_size,
+                                             std::size_t cols_size) override {
+        auto output = allocate(batch * rows_size * cols_size);
+        if (batch * rows_size * cols_size == 0) return output;
+        (void)checked_u32(batch * rows_size * cols_size, "transpose size");
         const auto rows = checked_u32(rows_size, "matrix dimension");
         const auto cols = checked_u32(cols_size, "matrix dimension");
         submit([&](id<MTLComputeCommandEncoder> encoder) {
@@ -208,10 +240,59 @@ public:
             [encoder setBuffer:as_metal(*output).buffer() offset:0 atIndex:1];
             [encoder setBytes:&rows length:sizeof(rows) atIndex:2];
             [encoder setBytes:&cols length:sizeof(cols) atIndex:3];
-            [encoder dispatchThreads:MTLSizeMake(cols_size, rows_size, 1)
+            [encoder dispatchThreads:MTLSizeMake(cols_size, rows_size, batch)
                  threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
         });
         return output;
+    }
+
+    std::shared_ptr<Storage> reduce_axis(const Storage& input, std::size_t outer,
+                                         std::size_t length, std::size_t inner,
+                                         cpu::ReduceOp operation) override {
+        if (length == 0 && operation != cpu::ReduceOp::Sum) {
+            throw std::invalid_argument("max/argmax over an empty axis is undefined");
+        }
+        auto output = allocate(outer * inner);
+        AxisMeta meta{checked_u32(outer, "outer size"), checked_u32(length, "axis length"),
+                      checked_u32(inner, "inner size"), static_cast<std::uint32_t>(operation)};
+        (void)checked_u32(outer * length * inner, "reduction size");
+        encode_1d(reduce_axis_pipeline_, outer * inner, [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:as_metal(input).buffer() offset:0 atIndex:0];
+            [encoder setBuffer:as_metal(*output).buffer() offset:0 atIndex:1];
+            [encoder setBytes:&meta length:sizeof(meta) atIndex:2];
+        });
+        return output;
+    }
+
+    std::shared_ptr<Storage> scatter_axis(const Storage& values, const Storage& indices,
+                                          std::size_t outer, std::size_t length,
+                                          std::size_t inner) override {
+        const auto total = outer * length * inner;
+        auto output = allocate(total);
+        AxisMeta meta{checked_u32(outer, "outer size"), checked_u32(length, "axis length"),
+                      checked_u32(inner, "inner size"), 0};
+        (void)checked_u32(total, "scatter size");
+        encode_1d(scatter_axis_pipeline_, total, [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:as_metal(values).buffer() offset:0 atIndex:0];
+            [encoder setBuffer:as_metal(indices).buffer() offset:0 atIndex:1];
+            [encoder setBuffer:as_metal(*output).buffer() offset:0 atIndex:2];
+            [encoder setBytes:&meta length:sizeof(meta) atIndex:3];
+        });
+        return output;
+    }
+
+    void axpy_inplace(Storage& target, const Storage& source, std::size_t count,
+                      float alpha) override {
+        if (count > target.size() || count > source.size()) {
+            throw std::out_of_range("Metal axpy exceeds storage");
+        }
+        const auto size = checked_u32(count, "element count");
+        encode_1d(axpy_pipeline_, count, [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:as_metal(target).buffer() offset:0 atIndex:0];
+            [encoder setBuffer:as_metal(source).buffer() offset:0 atIndex:1];
+            [encoder setBytes:&alpha length:sizeof(alpha) atIndex:2];
+            [encoder setBytes:&size length:sizeof(size) atIndex:3];
+        });
     }
 
     std::shared_ptr<Storage> reduce_sum(const Storage& input, std::size_t count) override {
@@ -343,6 +424,9 @@ private:
     id<MTLComputePipelineState> transpose_pipeline_;
     id<MTLComputePipelineState> reduce_pipeline_;
     id<MTLComputePipelineState> reduce_shape_pipeline_;
+    id<MTLComputePipelineState> reduce_axis_pipeline_;
+    id<MTLComputePipelineState> scatter_axis_pipeline_;
+    id<MTLComputePipelineState> axpy_pipeline_;
     bool ready_{false};
     std::string error_;
     std::mutex queue_mutex_;

@@ -59,6 +59,8 @@ void unary(const float* input, float* output, std::size_t count, UnaryOp operati
                 break;
             }
             case UnaryOp::ReluGradient: output[i] = input[i] > 0.0F ? 1.0F : 0.0F; break;
+            case UnaryOp::Exp: output[i] = std::exp(input[i]); break;
+            case UnaryOp::Log: output[i] = std::log(input[i]); break;
         }
     }
 }
@@ -117,6 +119,47 @@ float sum(const float* input, std::size_t count) {
     double total = accumulators[0] + accumulators[1] + accumulators[2] + accumulators[3];
     for (; i < count; ++i) total += input[i];
     return static_cast<float>(total);
+}
+
+void reduce_axis(const float* input, float* output, std::size_t outer,
+                 std::size_t length, std::size_t inner, ReduceOp operation) {
+    if (length == 0 && operation != ReduceOp::Sum) {
+        throw std::invalid_argument("max/argmax over an empty axis is undefined");
+    }
+    for (std::size_t o = 0; o < outer; ++o) {
+        const float* base = input + o * length * inner;
+        for (std::size_t i = 0; i < inner; ++i) {
+            float result = 0.0F;
+            if (operation == ReduceOp::Sum) {
+                double total = 0.0;
+                for (std::size_t a = 0; a < length; ++a) total += base[a * inner + i];
+                result = static_cast<float>(total);
+            } else {
+                std::size_t best = 0;
+                float best_value = base[i];
+                for (std::size_t a = 1; a < length; ++a) {
+                    const float value = base[a * inner + i];
+                    if (value > best_value) {
+                        best_value = value;
+                        best = a;
+                    }
+                }
+                result = operation == ReduceOp::Max ? best_value : static_cast<float>(best);
+            }
+            output[o * inner + i] = result;
+        }
+    }
+}
+
+void scatter_axis(const float* values, const float* indices, float* output,
+                  std::size_t outer, std::size_t length, std::size_t inner) {
+    std::fill(output, output + outer * length * inner, 0.0F);
+    for (std::size_t o = 0; o < outer; ++o) {
+        for (std::size_t i = 0; i < inner; ++i) {
+            const auto a = static_cast<std::size_t>(indices[o * inner + i]);
+            output[(o * length + a) * inner + i] = values[o * inner + i];
+        }
+    }
 }
 
 } // namespace vectorcore::cpu

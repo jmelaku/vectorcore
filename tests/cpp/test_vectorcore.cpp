@@ -261,6 +261,68 @@ int main() {
         throws([] { Tensor({1.0F}, {1}).retain_grad(); });
     });
 
+    test("axis reductions, exp/log and softmax", [] {
+        Tensor x({1, 5, 3, 4, 2, 6}, {2, 3});
+        close(x.sum(0), {5, 7, 9});
+        close(x.sum(-1, true), {9, 12});
+        check(x.sum(1, true).shape() == Shape({2, 1}), "keepdim shape");
+        close(x.mean(1), {3, 4});
+        close(x.max(1), {5, 6});
+        close(x.argmax(1), {1, 2});
+        close(x.max(), {6});
+        close(Tensor({0.0F, 1.0F}, {2}).exp(), {1.0F, std::exp(1.0F)});
+        close(Tensor({1.0F, std::exp(2.0F)}, {2}).log(), {0.0F, 2.0F}, 1e-5F);
+        const auto probabilities = x.softmax(1);
+        close(probabilities.sum(1), {1, 1}, 1e-6F);
+        throws([&] { (void)x.sum(2); });
+        throws([&] { (void)x.max(-3); });
+        throws([] { (void)Tensor::scalar(1.0F).sum(0); });
+    });
+
+    test("cross-entropy value and gradient", [] {
+        Tensor logits({0, 0, 0, 0}, {2, 2}, true);
+        auto loss = nn::cross_entropy(logits, {0, 1});
+        check(std::abs(loss.item() - std::log(2.0F)) < 1e-6F, "uniform CE should be log 2");
+        loss.backward();
+        // d/dlogits = (softmax - one_hot) / batch
+        close(logits.grad(), {-0.25F, 0.25F, 0.25F, -0.25F});
+        throws([&] { (void)nn::cross_entropy(logits, {0}); });
+        throws([&] { (void)nn::cross_entropy(logits, {0, 2}); });
+    });
+
+    test("batched and broadcast matmul", [] {
+        // Two batches of [1x2] @ shared [2x2].
+        Tensor a({1, 2, 3, 4}, {2, 1, 2}, true);
+        Tensor w({1, 0, 0, 2}, {2, 2}, true);
+        auto y = a.matmul(w);
+        check(y.shape() == Shape({2, 1, 2}), "batched output shape");
+        close(y, {1, 4, 3, 8});
+        y.sum().backward();
+        close(w.grad(), {4, 4, 6, 6});  // summed over both batches
+        close(a.grad(), {1, 2, 1, 2});
+        close(Tensor({1, 2, 3, 4, 5, 6, 7, 8}, {2, 2, 2}).transpose(), {1, 3, 2, 4, 5, 7, 6, 8});
+        throws([] { (void)Tensor::ones({2, 2, 3}).matmul(Tensor::ones({3, 3, 1})); });
+    });
+
+    test("Metal classifier ops and SGD", [] {
+        if (!metal_available()) return;
+        Tensor x({1, 5, 3, 4, 2, 6}, {2, 3});
+        auto mx = x.to(Device::metal());
+        close(mx.sum(1).to(Device::cpu()), {9, 12});
+        close(mx.max(0).to(Device::cpu()), {4, 5, 6});
+        close(mx.argmax(1).to(Device::cpu()), {1, 2});
+        close(mx.softmax(1).to(Device::cpu()), x.softmax(1).to_vector(), 1e-5F);
+        Tensor batched({1, 2, 3, 4}, {2, 1, 2});
+        Tensor w({1, 0, 0, 2}, {2, 2});
+        close(batched.to(Device::metal()).matmul(w.to(Device::metal())).to(Device::cpu()),
+              {1, 4, 3, 8});
+
+        Tensor p({1, 2}, {2}, true, Device::metal());
+        (p * p).sum().backward();
+        nn::sgd_step({&p}, 0.5F);
+        close(p.to(Device::cpu()), {0, 0});  // p - 0.5 * 2p
+    });
+
     std::cout << tests - failures << "/" << tests << " tests passed\n";
     return failures == 0 ? 0 : 1;
 }
