@@ -190,3 +190,149 @@ kernel void axpy_inplace(device float* target [[buffer(0)]],
                          uint gid [[thread_position_in_grid]]) {
     if (gid < count) target[gid] += alpha * source[gid];
 }
+
+#ifdef VECTORCORE_SIMDGROUP_MATRIX
+#include <metal_simdgroup_matrix>
+
+// GEMM on Apple-family GPUs using the hardware 8x8 simdgroup matrix
+// multiply-accumulate. A threadgroup of 4 simdgroups (128 threads) computes a
+// 64x64 tile of C; the simdgroups form a 2x2 grid and each accumulates a 32x32
+// block as 4x4 simdgroup_float8x8 fragments. Each K step stages a 64x16 slice
+// of A and a 16x64 slice of B in threadgroup memory, double-buffered so the
+// next slice loads while the current one is multiplied.
+constant uint SG_BM = 64;
+constant uint SG_BN = 64;
+constant uint SG_BK = 16;
+
+// Each of the 128 threads loads 8 elements of A and 8 of B per K step. The
+// thread-to-element mapping follows each operand's storage order so that
+// neighbouring threads read neighbouring addresses (coalesced loads).
+inline void load_gemm_tiles(threadgroup float* tile_a, threadgroup float* tile_b,
+                            const device float* a, const device float* b,
+                            uint m, uint k, uint n, uint row0, uint col0, uint k0, uint tid) {
+    for (uint i = 0; i < 8; ++i) {
+        const uint t = tid + i * 128;
+        uint r, c;
+        if (TRANS_A) { r = t % SG_BM; c = t / SG_BM; }
+        else         { r = t / SG_BK; c = t % SG_BK; }
+        const uint gr = row0 + r, gc = k0 + c;
+        float v = 0.0f;
+        if (gr < m && gc < k) v = TRANS_A ? a[gc * m + gr] : a[gr * k + gc];
+        tile_a[r * SG_BK + c] = v;
+
+        uint kr, cc;
+        if (TRANS_B) { kr = t % SG_BK; cc = t / SG_BK; }
+        else         { kr = t / SG_BN; cc = t % SG_BN; }
+        const uint gk = k0 + kr, gn = col0 + cc;
+        float w = 0.0f;
+        if (gk < k && gn < n) w = TRANS_B ? b[gn * k + gk] : b[gk * n + gn];
+        tile_b[kr * SG_BN + cc] = w;
+    }
+}
+
+kernel void matmul_simdgroup(const device float* a [[buffer(0)]],
+                             const device float* b [[buffer(1)]],
+                             device float* output [[buffer(2)]],
+                             constant uint& m [[buffer(3)]],
+                             constant uint& k [[buffer(4)]],
+                             constant uint& n [[buffer(5)]],
+                             const device uint2* offsets [[buffer(6)]],
+                             uint3 group [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tile_a[2][SG_BM * SG_BK];
+    threadgroup float tile_b[2][SG_BK * SG_BN];
+
+    const device float* batch_a = a + offsets[group.z].x;
+    const device float* batch_b = b + offsets[group.z].y;
+    const uint row0 = group.y * SG_BM;
+    const uint col0 = group.x * SG_BN;
+    const uint sg_row = (sg / 2) * 32;
+    const uint sg_col = (sg % 2) * 32;
+
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 4; ++j) acc[i][j] = simdgroup_float8x8(0.0f);
+
+    // Interior fast path: when the whole 64x64 tile is in bounds and k is a
+    // multiple of 8, every 8x8 fragment can be loaded straight from device
+    // memory (the GPU caches provide the reuse that threadgroup staging would),
+    // with no bounds checks and no barriers. simdgroup_load's transpose flag
+    // handles transposed operands. The decision is uniform per threadgroup.
+    if (row0 + SG_BM <= m && col0 + SG_BN <= n && (k % 8) == 0) {
+        const uint a_row = row0 + sg_row;
+        const uint b_col = col0 + sg_col;
+        for (uint k0 = 0; k0 < k; k0 += 8) {
+            simdgroup_float8x8 fa[4];
+            simdgroup_float8x8 fb[4];
+            for (uint i = 0; i < 4; ++i) {
+                if (TRANS_A) simdgroup_load(fa[i], batch_a + ulong(k0) * m + a_row + i * 8, m, ulong2(0), true);
+                else         simdgroup_load(fa[i], batch_a + ulong(a_row + i * 8) * k + k0, k);
+                if (TRANS_B) simdgroup_load(fb[i], batch_b + ulong(b_col + i * 8) * k + k0, k, ulong2(0), true);
+                else         simdgroup_load(fb[i], batch_b + ulong(k0) * n + b_col + i * 8, n);
+            }
+            for (uint i = 0; i < 4; ++i)
+                for (uint j = 0; j < 4; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);
+        }
+        device float* batch_out = output + group.z * m * n;
+        for (uint i = 0; i < 4; ++i)
+            for (uint j = 0; j < 4; ++j)
+                simdgroup_store(acc[i][j], batch_out + ulong(a_row + i * 8) * n + b_col + j * 8, n);
+        return;
+    }
+
+    const uint steps = (k + SG_BK - 1) / SG_BK;
+    load_gemm_tiles(tile_a[0], tile_b[0], batch_a, batch_b, m, k, n, row0, col0, 0, tid);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint step = 0; step < steps; ++step) {
+        const uint current = step & 1;
+        if (step + 1 < steps) {
+            load_gemm_tiles(tile_a[current ^ 1], tile_b[current ^ 1], batch_a, batch_b,
+                            m, k, n, row0, col0, (step + 1) * SG_BK, tid);
+        }
+        for (uint kk = 0; kk < SG_BK; kk += 8) {
+            simdgroup_float8x8 fa[4];
+            simdgroup_float8x8 fb[4];
+            for (uint i = 0; i < 4; ++i) {
+                simdgroup_load(fa[i], &tile_a[current][(sg_row + i * 8) * SG_BK + kk], SG_BK);
+                simdgroup_load(fb[i], &tile_b[current][kk * SG_BN + sg_col + i * 8], SG_BN);
+            }
+            for (uint i = 0; i < 4; ++i)
+                for (uint j = 0; j < 4; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], fa[i], fb[j], acc[i][j]);
+        }
+        // One barrier per step: it both publishes the next buffer and stops
+        // the following load from overwriting the buffer just consumed.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float* batch_out = output + group.z * m * n;
+    const uint out_row = row0 + sg_row;
+    const uint out_col = col0 + sg_col;
+    if (out_row + 32 <= m && out_col + 32 <= n) {
+        for (uint i = 0; i < 4; ++i)
+            for (uint j = 0; j < 4; ++j)
+                simdgroup_store(acc[i][j], batch_out + (out_row + i * 8) * n + out_col + j * 8, n);
+        return;
+    }
+    // Edge block: stage through threadgroup memory (reusing the A tiles, which
+    // are free after the final barrier) and write only the valid elements.
+    // The A tiles hold 2048 floats: 512 per simdgroup, i.e. one 32x16 half of
+    // its 32x32 block at a time.
+    threadgroup float* stage = &tile_a[0][0] + sg * 512;
+    for (uint part = 0; part < 2; ++part) {
+        for (uint i = 0; i < 4; ++i)
+            for (uint j = 0; j < 2; ++j)
+                simdgroup_store(acc[i][part * 2 + j], stage + (i * 8) * 16 + j * 8, 16);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = lane; e < 32 * 16; e += 32) {
+            const uint r = e / 16, c = e % 16;
+            const uint gr = out_row + r, gc = out_col + part * 16 + c;
+            if (gr < m && gc < n) batch_out[gr * n + gc] = stage[r * 16 + c];
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+#endif

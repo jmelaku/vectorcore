@@ -2,6 +2,11 @@
 sizes, every elementwise fast path, parallel reductions, and asynchronous
 Metal execution (ordering, in-place updates, buffer reuse)."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import numpy as np
 import pytest
 import vectorcore as vc
@@ -22,6 +27,9 @@ GEMM_SHAPES = [
     (3, 5, 7), (4, 33, 33), (8, 256, 12), (16, 512, 24), (9, 257, 13),
     (63, 100, 97), (64, 64, 96), (65, 300, 95), (127, 513, 129),
     (200, 37, 1), (1, 300, 300), (300, 1, 300), (8, 3, 4100), (777, 64, 5),
+    # Metal simdgroup kernel: fully interior 64x64 tiles with k % 8 == 0 take
+    # the direct-load path; the others mix it with the staged edge path.
+    (128, 64, 128), (192, 256, 64), (128, 60, 128), (130, 64, 128), (128, 64, 70),
 ]
 
 
@@ -47,6 +55,52 @@ def test_large_matmul_and_gradients_match_numpy():
     np.testing.assert_allclose(tb.grad.numpy(),
                                np.broadcast_to(a.sum(axis=0)[:, None], b.shape),
                                rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("m,k,n", [(128, 64, 192), (64, 128, 64), (100, 72, 90), (128, 60, 128)])
+def test_matmul_gradients_use_transposed_kernels(device, m, k, n):
+    # Backward runs op(A) @ op(B) with transpose flags; on Metal this covers
+    # the TRANS_A / TRANS_B pipeline variants on aligned and ragged shapes.
+    rng = np.random.default_rng(m + k + n)
+    a = rng.uniform(-1, 1, size=(m, k)).astype(np.float32)
+    b = rng.uniform(-1, 1, size=(k, n)).astype(np.float32)
+    g = rng.uniform(-1, 1, size=(m, n)).astype(np.float32)
+    ta = vc.Tensor(a, requires_grad=True, device=device)
+    tb = vc.Tensor(b, requires_grad=True, device=device)
+    (ta @ tb).backward(vc.Tensor(g, device=device))
+    np.testing.assert_allclose(ta.grad.to("cpu").numpy(), reference_matmul(g, b.T),
+                               rtol=1e-4, atol=1e-4 * np.sqrt(n))
+    np.testing.assert_allclose(tb.grad.to("cpu").numpy(), reference_matmul(a.T, g),
+                               rtol=1e-4, atol=1e-4 * np.sqrt(m))
+
+
+@metal_only
+def test_gemm_kernel_selection():
+    kernel = vc.metal_gemm_kernel()
+    if os.environ.get("VECTORCORE_METAL_GEMM") == "tiled":
+        assert kernel == "tiled"
+    else:
+        # "tiled (simdgroup kernel unavailable: ...)" means the fast kernel was
+        # wanted on this GPU but failed to build: that is a bug, not a fallback.
+        assert kernel in ("simdgroup", "tiled"), kernel
+
+
+@metal_only
+@pytest.mark.skipif(os.environ.get("VECTORCORE_METAL_GEMM") == "tiled",
+                    reason="already running with the tiled kernel")
+def test_tiled_fallback_kernel_passes_matmul_tests():
+    # Re-run the matmul and gradient tests in a fresh process with the
+    # portable kernel forced, so the fallback path stays covered.
+    here = Path(__file__).parent
+    env = dict(os.environ, VECTORCORE_METAL_GEMM="tiled")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         str(here / "test_performance_paths.py"), str(here / "test_classifier_ops.py"),
+         str(here / "test_autograd_correctness.py"),
+         "-k", "matmul or gradcheck or gemm_kernel or mlp"],
+        env=env, capture_output=True, text=True, timeout=600)
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-3000:]
 
 
 BROADCAST_CASES = [

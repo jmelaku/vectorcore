@@ -20,7 +20,7 @@ The core does **not** call NumPy, PyTorch, Eigen, or another tensor library. Num
 - a packed, register-blocked CPU GEMM (BLIS-style panels with an 8x12 NEON FMA microkernel and a portable fallback), with transposed operands read in place so backward passes never materialise `A^T`/`B^T`
 - a persistent thread pool with dynamic chunk scheduling (which balances Apple performance and efficiency cores) used by GEMM, elementwise kernels, reductions and transpose; reductions combine fixed-size chunks in order, so results do not depend on thread count
 - elementwise fast paths for same-shape and scalar operands, and row-wise broadcasting that resolves offsets once per row instead of per element
-- real Metal buffers and shaders for broadcast elementwise operations, activations, transpose, tree and axis reductions, and batched tiled matrix multiplication (specialised per transpose combination with function constants)
+- real Metal buffers and shaders for broadcast elementwise operations, activations, transpose, tree and axis reductions, and batched matrix multiplication: on Apple-family GPUs (M1 or newer) a kernel built on the hardware 8x8 `simdgroup_matrix` multiply-accumulate units, with a portable threadgroup-tiled kernel as fallback; both are specialised per transpose combination with function constants, and `vc.metal_gemm_kernel()` reports which one is active
 - asynchronous Metal execution: operations are encoded into shared command buffers and only waited on when the host reads values (`item()`, `to('cpu')`) or calls `vc.synchronize()`; freed buffers are recycled through a size-class pool once the GPU work that used them has completed
 - Python `Tensor`, `Linear`, MSE and cross-entropy losses, and SGD on both CPU and Metal parameters
 - deterministic linear-regression, two-layer-network, and spiral-classifier training examples
@@ -112,7 +112,7 @@ The checked run converged linear regression from loss `1.99738` to `6.32e-14` an
 The final validated run on an Apple M4 passed:
 
 - C++: 23/23 cases
-- Python: 213/213 cases
+- Python: 233/233 cases (including a re-run of the matmul and gradient tests with the tiled Metal kernel forced via `VECTORCORE_METAL_GEMM=tiled`)
 - ASan + UBSan C++ run: 23/23 cases (macOS does not provide ASan leak detection)
 - ThreadSanitizer C++ run: 23/23 cases (covers the thread pool and Metal completion handlers)
 - Metal disabled (`-DVECTORCORE_ENABLE_METAL=OFF`): 23/23 cases
@@ -145,7 +145,7 @@ Inputs are created before timing; each operation receives two warmups; the media
 | 2048 | PyTorch CPU | 1.495 | 1.744 | 22.814 |
 | 2048 | PyTorch MPS | 1.498 | 1.413 | 10.930 |
 
-The table above predates the performance work and is kept for reference. An interleaved A/B comparison of the current kernels against the previous version (same machine, same moment) measured: CPU elementwise 19–30x faster, CPU GEMM 5–7x faster (about 460–540 GFLOP/s at 2048 when the machine is idle), CPU training steps 2–3x faster, and Metal training steps 21–31x faster thanks to asynchronous submission. Standalone Metal GEMM is unchanged. VectorCore is still not faster than vendor libraries: NumPy/PyTorch CPU use Apple's AMX-backed Accelerate GEMM, and PyTorch MPS uses Apple's tuned Metal kernels. Method, numbers and caveats are in [benchmarks.md](docs/benchmarks.md).
+The table above predates the performance work and is kept for reference. An interleaved A/B comparison of the current kernels against the previous version (same machine, same moment) measured: CPU elementwise 19–30x faster, CPU GEMM 5–7x faster (about 460–540 GFLOP/s at 2048 when the machine is idle), CPU training steps 2–3x faster, and Metal training steps 21–31x faster thanks to asynchronous submission. A later simdgroup-matrix Metal GEMM made standalone 2048 GEMM about 2.5x faster than the tiled kernel. VectorCore is still not faster than vendor libraries: NumPy/PyTorch CPU use Apple's AMX-backed Accelerate GEMM, and PyTorch MPS uses Apple's tuned Metal kernels. Method, numbers and caveats are in [benchmarks.md](docs/benchmarks.md).
 
 ## Known limitations
 
@@ -154,7 +154,7 @@ The table above predates the performance work and is kept for reference. An inte
 - `transpose` swaps the last two axes; there is no general axis permutation.
 - all operation outputs are contiguous; only reshape is a shared-storage view.
 - Metal operations are not fused, and each single op still costs one command-buffer round trip when timed in isolation with a synchronize. GPU errors are reported at the next synchronization point rather than at the failing operation.
-- The Metal GEMM is a straightforward 16x16 threadgroup-tiled kernel (no simdgroup matrix instructions); PyTorch MPS is several times faster at large sizes.
+- The simdgroup Metal GEMM is about 2.5x faster than the tiled kernel at 2048 but still trails PyTorch MPS (Apple's tuned kernels); it has no threadgroup swizzling, vectorised loads or larger register tiles yet, and sizes up to ~512 are dominated by the per-synchronize round trip.
 - SGD is the only optimizer (no momentum or Adam yet).
 - graphs are retained as long as output tensors reference them; there is no `retain_graph`/early-release API.
 

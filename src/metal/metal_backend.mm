@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <atomic>
 #include <cstdint>
 #include <limits>
@@ -91,7 +92,23 @@ public:
             NSError* error = nil;
             NSString* source = [NSString stringWithUTF8String:detail::embedded_metal_source];
             MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-            library_ = [device_ newLibraryWithSource:source options:options error:&error];
+            // simdgroup_matrix needs an Apple7-family GPU (M1/A14 or newer).
+            // VECTORCORE_METAL_GEMM=tiled forces the portable kernel (used by
+            // tests to keep the fallback covered).
+            const char* gemm_override = std::getenv("VECTORCORE_METAL_GEMM");
+            const bool want_simdgroup = [device_ supportsFamily:MTLGPUFamilyApple7] &&
+                !(gemm_override && std::string(gemm_override) == "tiled");
+            if (want_simdgroup) {
+                options.preprocessorMacros = @{@"VECTORCORE_SIMDGROUP_MATRIX" : @"1"};
+                library_ = [device_ newLibraryWithSource:source options:options error:&error];
+                if (!library_) {
+                    // Fall back to the portable kernels rather than losing Metal.
+                    simdgroup_note_ = "shader compilation failed: " + utf8(error.localizedDescription);
+                    options.preprocessorMacros = @{};
+                    error = nil;
+                }
+            }
+            if (!library_) library_ = [device_ newLibraryWithSource:source options:options error:&error];
             if (!library_) {
                 error_ = "Metal shader compilation failed: " + utf8(error.localizedDescription);
                 return;
@@ -99,7 +116,18 @@ public:
             binary_pipeline_ = pipeline(@"binary_broadcast");
             unary_pipeline_ = pipeline(@"unary");
             for (int variant = 0; variant < 4; ++variant) {
-                matmul_pipelines_[variant] = matmul_pipeline(variant & 1, (variant & 2) != 0);
+                matmul_pipelines_[variant] =
+                    matmul_pipeline(@"matmul_tiled", variant & 1, (variant & 2) != 0, true);
+            }
+            if (want_simdgroup && simdgroup_note_.empty()) {
+                use_simdgroup_ = true;
+                for (int variant = 0; variant < 4; ++variant) {
+                    simdgroup_pipelines_[variant] =
+                        matmul_pipeline(@"matmul_simdgroup", variant & 1, (variant & 2) != 0, false);
+                    use_simdgroup_ = use_simdgroup_ && simdgroup_pipelines_[variant] &&
+                        simdgroup_pipelines_[variant].maxTotalThreadsPerThreadgroup >= 128;
+                }
+                if (!use_simdgroup_ && simdgroup_note_.empty()) simdgroup_note_ = "pipeline creation failed";
             }
             transpose_pipeline_ = pipeline(@"transpose_2d");
             reduce_pipeline_ = pipeline(@"reduce_sum_pass");
@@ -118,6 +146,11 @@ public:
     bool available() const noexcept override { return ready_; }
     std::string device_name() const override { return device_ ? utf8(device_.name) : "unavailable"; }
     std::string last_error() const override { return error_; }
+    std::string gemm_kernel() const override {
+        if (!ready_) return "unavailable";
+        if (use_simdgroup_) return "simdgroup";
+        return simdgroup_note_.empty() ? "tiled" : "tiled (simdgroup kernel unavailable: " + simdgroup_note_ + ")";
+    }
 
     ~MetalBackendImpl() override {
         // Tensors that outlive the backend (e.g. at interpreter shutdown) must
@@ -247,7 +280,9 @@ public:
                                                           options:MTLResourceStorageModeShared];
         if (!offset_buffer) throw std::runtime_error("Metal buffer allocation failed");
         submit([&](id<MTLComputeCommandEncoder> encoder) {
-            [encoder setComputePipelineState:matmul_pipelines_[(trans_a ? 1 : 0) | (trans_b ? 2 : 0)]];
+            const int variant = (trans_a ? 1 : 0) | (trans_b ? 2 : 0);
+            [encoder setComputePipelineState:use_simdgroup_ ? simdgroup_pipelines_[variant]
+                                                            : matmul_pipelines_[variant]];
             [encoder setBuffer:as_metal(a).buffer() offset:0 atIndex:0];
             [encoder setBuffer:as_metal(b).buffer() offset:0 atIndex:1];
             [encoder setBuffer:as_metal(*output).buffer() offset:0 atIndex:2];
@@ -255,11 +290,18 @@ public:
             [encoder setBytes:&k length:sizeof(k) atIndex:4];
             [encoder setBytes:&n length:sizeof(n) atIndex:5];
             [encoder setBuffer:offset_buffer offset:0 atIndex:6];
-            // Launch complete tiles: even edge outputs need all 16 lanes to
-            // cooperatively load K-dimension values into threadgroup memory.
-            [encoder dispatchThreadgroups:MTLSizeMake((n_size + 15) / 16,
-                                                       (m_size + 15) / 16, batch)
-                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            if (use_simdgroup_) {
+                // 64x64 output tile per threadgroup of 4 simdgroups.
+                [encoder dispatchThreadgroups:MTLSizeMake((n_size + 63) / 64,
+                                                           (m_size + 63) / 64, batch)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            } else {
+                // Launch complete tiles: even edge outputs need all 16 lanes to
+                // cooperatively load K-dimension values into threadgroup memory.
+                [encoder dispatchThreadgroups:MTLSizeMake((n_size + 15) / 16,
+                                                           (m_size + 15) / 16, batch)
+                     threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+            }
         });
         return output;
     }
@@ -402,21 +444,26 @@ public:
     }
 
 private:
-    id<MTLComputePipelineState> matmul_pipeline(bool trans_a, bool trans_b) {
+    // required=false: a failure only disables that optional kernel.
+    id<MTLComputePipelineState> matmul_pipeline(NSString* name, bool trans_a, bool trans_b,
+                                                bool required) {
         MTLFunctionConstantValues* constants = [[MTLFunctionConstantValues alloc] init];
         [constants setConstantValue:&trans_a type:MTLDataTypeBool atIndex:0];
         [constants setConstantValue:&trans_b type:MTLDataTypeBool atIndex:1];
         NSError* error = nil;
-        id<MTLFunction> function = [library_ newFunctionWithName:@"matmul_tiled"
+        id<MTLFunction> function = [library_ newFunctionWithName:name
                                                   constantValues:constants
                                                            error:&error];
         if (!function) {
-            error_ = "Metal matmul specialisation failed: " + utf8(error.localizedDescription);
+            const auto message = "specialisation of " + utf8(name) + " failed: " + utf8(error.localizedDescription);
+            if (required) error_ = message; else simdgroup_note_ = message;
             return nil;
         }
         auto result = [device_ newComputePipelineStateWithFunction:function error:&error];
-        if (!result) error_ = "pipeline creation failed for matmul_tiled: " +
-                              utf8(error.localizedDescription);
+        if (!result) {
+            const auto message = "pipeline creation failed for " + utf8(name) + ": " + utf8(error.localizedDescription);
+            if (required) error_ = message; else simdgroup_note_ = message;
+        }
         return result;
     }
 
@@ -531,6 +578,9 @@ private:
     id<MTLComputePipelineState> binary_pipeline_;
     id<MTLComputePipelineState> unary_pipeline_;
     id<MTLComputePipelineState> matmul_pipelines_[4];  // index: trans_a | trans_b << 1
+    id<MTLComputePipelineState> simdgroup_pipelines_[4];
+    bool use_simdgroup_{false};
+    std::string simdgroup_note_;  // why the simdgroup kernel is not in use, if it was wanted
     id<MTLComputePipelineState> transpose_pipeline_;
     id<MTLComputePipelineState> reduce_pipeline_;
     id<MTLComputePipelineState> reduce_axis_pipeline_;

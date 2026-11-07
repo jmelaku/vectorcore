@@ -172,6 +172,8 @@ PYBIND11_MODULE(vectorcore, module) {
     });
     module.def("metal_available", &metal_available);
     module.def("metal_device_name", &metal_device_name);
+    module.def("metal_gemm_kernel", [] { return MetalBackend::instance().gemm_kernel(); },
+               "Which Metal matmul kernel is active: 'simdgroup', 'tiled' or 'unavailable'.");
     module.def("synchronize", &vectorcore::synchronize,
                "Wait for all queued Metal work; reading tensor values does this automatically.");
 }

@@ -9,6 +9,7 @@ public:
     bool available() const noexcept override { return false; }
     std::string device_name() const override { return "unavailable"; }
     std::string last_error() const override { return "VectorCore was built without Apple Metal"; }
+    std::string gemm_kernel() const override { return "unavailable"; }
     std::shared_ptr<Storage> allocate(std::size_t) override { fail(); }
     std::shared_ptr<Storage> upload(const float*, std::size_t) override { fail(); }
     void download(const Storage&, float*, std::size_t) override { fail(); }

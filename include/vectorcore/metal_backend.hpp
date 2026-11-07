@@ -18,6 +18,8 @@ public:
     [[nodiscard]] virtual bool available() const noexcept = 0;
     [[nodiscard]] virtual std::string device_name() const = 0;
     [[nodiscard]] virtual std::string last_error() const = 0;
+    // "simdgroup" (hardware matrix units), "tiled" (portable), or "unavailable".
+    [[nodiscard]] virtual std::string gemm_kernel() const = 0;
     [[nodiscard]] virtual std::shared_ptr<Storage> allocate(std::size_t elements) = 0;
     [[nodiscard]] virtual std::shared_ptr<Storage> upload(const float* data,
                                                           std::size_t elements) = 0;

@@ -31,7 +31,21 @@ PYTHONPATH=build .venv/bin/python benchmarks/train_benchmark.py
 
 `train_benchmark.py` times a complete SGD step (forward, cross-entropy, backward, update, and a host read of the loss so asynchronous GPU work is included) for VectorCore and, when installed, PyTorch CPU/MPS.
 
-## Original baseline (2026-10-02)
+## Metal GEMM: simdgroup kernel vs tiled kernel (2026-11-07)
+
+Same build, kernel selected per process with `VECTORCORE_METAL_GEMM=tiled`, three alternating rounds, median milliseconds including one synchronize. The GPU was shared with a game and a Docker VM during the run (load average 26-42), so absolute times are pessimistic; the ratio is the result.
+
+| Shape (m x k x n) | Tiled | Simdgroup | Speedup |
+|---|---:|---:|---:|
+| 256 x 784 x 256 | 1.398 | 1.355 | 1.0x |
+| 512 x 512 x 512 | 2.022 | 2.015 | 1.0x |
+| 1024 x 1024 x 1024 | 7.154 | 5.310 | 1.35x |
+| 2048 x 2048 x 2048 | 63.289 | 25.384 | 2.5x |
+| 4096 x 4096 x 4096 | 986.5 | 506.8 | 1.95x |
+
+Small sizes are bound by the command-buffer round trip of a synchronized single operation, not by the kernel. An earlier version of the simdgroup kernel that staged every K slice through threadgroup memory was only 1.14-1.19x faster at large sizes; loading fragments directly from device memory for interior tiles is what produced the gain. A threadgroup launch-order swizzle was tried and showed no reliable improvement, so it was not kept.
+
+
 
 The tables below were recorded for the first version of the runtime, before the performance work, and are kept for reference.
 
