@@ -3,7 +3,8 @@
 
 Inputs are allocated before timing. Each framework performs a warmup, every GPU
 result is synchronized, and the reported value is the median wall-clock time.
-VectorCore Metal currently synchronizes each operation internally. Transfers are
+VectorCore Metal executes asynchronously, so its timings end with
+vc.synchronize(), like torch.mps.synchronize() for PyTorch. Transfers are
 reported separately and are never included in kernel measurements.
 """
 
@@ -70,9 +71,9 @@ def main():
                 ("matmul", lambda: ma @ mb),
             ):
                 print_row(size, name, "vectorcore_metal",
-                          measure(operation, repeats=args.repeats))
+                          measure(operation, vc.synchronize, repeats=args.repeats))
             print_row(size, "cpu_to_metal", "vectorcore_transfer",
-                      measure(lambda: va.to("metal"), repeats=args.repeats))
+                      measure(lambda: va.to("metal"), vc.synchronize, repeats=args.repeats))
             print_row(size, "metal_to_cpu", "vectorcore_transfer",
                       measure(lambda: ma.to("cpu"), repeats=args.repeats))
 

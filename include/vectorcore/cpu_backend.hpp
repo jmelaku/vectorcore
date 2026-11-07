@@ -14,8 +14,14 @@ void binary(const float* a, const Shape& a_shape, const Strides& a_strides,
             const float* b, const Shape& b_shape, const Strides& b_strides,
             float* out, const Shape& out_shape, BinaryOp operation);
 void unary(const float* input, float* output, std::size_t count, UnaryOp operation);
+// out (m x n) = op(a) @ op(b), row-major. With trans_a, `a` is stored as
+// (k x m); with trans_b, `b` is stored as (n x k).
 void matmul(const float* a, const float* b, float* out,
-            std::size_t m, std::size_t k, std::size_t n);
+            std::size_t m, std::size_t k, std::size_t n,
+            bool trans_a = false, bool trans_b = false);
+// Swap the last two axes of a contiguous [batch, rows, cols] tensor.
+void transpose(const float* input, float* output, std::size_t batch,
+               std::size_t rows, std::size_t cols);
 float sum(const float* input, std::size_t count);
 
 // Reduce the middle axis of a contiguous [outer, length, inner] view into

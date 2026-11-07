@@ -34,15 +34,13 @@ public:
     [[nodiscard]] virtual std::shared_ptr<Storage> matmul(
         const Storage& a, const Storage& b, std::size_t m, std::size_t k, std::size_t n,
         const std::vector<std::size_t>& a_offsets,
-        const std::vector<std::size_t>& b_offsets) = 0;
+        const std::vector<std::size_t>& b_offsets,
+        bool trans_a = false, bool trans_b = false) = 0;
     // Swap the last two axes of a contiguous [batch, rows, cols] tensor.
     [[nodiscard]] virtual std::shared_ptr<Storage> transpose_last2(
         const Storage& input, std::size_t batch, std::size_t rows, std::size_t cols) = 0;
     [[nodiscard]] virtual std::shared_ptr<Storage> reduce_sum(
         const Storage& input, std::size_t count) = 0;
-    [[nodiscard]] virtual std::shared_ptr<Storage> reduce_to_shape(
-        const Storage& input, const Shape& input_shape,
-        const Shape& target_shape) = 0;
     [[nodiscard]] virtual std::shared_ptr<Storage> reduce_axis(
         const Storage& input, std::size_t outer, std::size_t length, std::size_t inner,
         cpu::ReduceOp operation) = 0;
@@ -57,5 +55,9 @@ public:
 
 [[nodiscard]] bool metal_available();
 [[nodiscard]] std::string metal_device_name();
+// Block until all queued GPU work has finished and surface any GPU error.
+// Metal operations are asynchronous; reading a tensor's values (item(),
+// to_vector(), to(cpu)) synchronizes automatically. No-op without Metal.
+void synchronize();
 
 } // namespace vectorcore

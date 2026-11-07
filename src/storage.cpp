@@ -18,14 +18,20 @@ namespace {
 
 class CPUStorage final : public Storage {
 public:
-    explicit CPUStorage(std::size_t elements) : values_(elements) {}
-    CPUStorage(const float* values, std::size_t elements) : values_(values, values + elements) {}
+    // Output buffers are always fully written by the kernel that creates
+    // them, so skip value-initialisation (a full memset per allocation).
+    explicit CPUStorage(std::size_t elements)
+        : values_(elements ? new float[elements] : nullptr), size_(elements) {}
+    CPUStorage(const float* values, std::size_t elements) : CPUStorage(elements) {
+        if (elements) std::copy(values, values + elements, values_.get());
+    }
     [[nodiscard]] Device device() const noexcept override { return Device::cpu(); }
-    [[nodiscard]] std::size_t size() const noexcept override { return values_.size(); }
-    [[nodiscard]] const float* data() const override { return values_.data(); }
-    [[nodiscard]] float* mutable_data() override { return values_.data(); }
+    [[nodiscard]] std::size_t size() const noexcept override { return size_; }
+    [[nodiscard]] const float* data() const override { return values_.get(); }
+    [[nodiscard]] float* mutable_data() override { return values_.get(); }
 private:
-    std::vector<float> values_;
+    std::unique_ptr<float[]> values_;
+    std::size_t size_;
 };
 
 } // namespace

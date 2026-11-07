@@ -323,6 +323,45 @@ int main() {
         close(p.to(Device::cpu()), {0, 0});  // p - 0.5 * 2p
     });
 
+    test("parallel CPU kernels match a reference", [] {
+        // Large enough to take the threaded, packed paths (also run under TSan).
+        const std::size_t m = 150, k = 300, n = 130;
+        auto a = Tensor::randn({m, k}, false, 3);
+        auto b = Tensor::randn({k, n}, false, 4);
+        const auto c = a.matmul(b).to_vector();
+        const auto av = a.to_vector();
+        const auto bv = b.to_vector();
+        for (std::size_t i = 0; i < m; i += 7) {
+            for (std::size_t j = 0; j < n; j += 5) {
+                double expected = 0.0;
+                for (std::size_t p = 0; p < k; ++p) expected += double(av[i * k + p]) * bv[p * n + j];
+                check(std::abs(c[i * n + j] - expected) < 1e-3, "packed matmul mismatch");
+            }
+        }
+        // Transposed operands through backward: dA = dY @ B^T, dB = A^T @ dY.
+        auto x = Tensor::randn({m, k}, true, 5);
+        auto w = Tensor::randn({k, n}, true, 6);
+        x.matmul(w).sum().backward();
+        const auto wv = w.to_vector();
+        const auto gx = x.grad().to_vector();
+        for (std::size_t p = 0; p < k; p += 11) {
+            double row_sum = 0.0;
+            for (std::size_t j = 0; j < n; ++j) row_sum += wv[p * n + j];
+            check(std::abs(gx[p] - row_sum) < 1e-3, "transposed-B gradient mismatch");
+        }
+
+        auto big = Tensor::randn({1000, 300}, false, 7);
+        auto row = Tensor::randn({300}, false, 8);
+        const auto sum1 = (big + row).sum().item();
+        const auto sum2 = (big + row).sum().item();
+        check(sum1 == sum2, "parallel sum is not deterministic");
+        double expected_sum = 0.0;
+        const auto bigv = big.to_vector();
+        const auto rowv = row.to_vector();
+        for (std::size_t i = 0; i < bigv.size(); ++i) expected_sum += bigv[i] + rowv[i % 300];
+        check(std::abs(sum1 - expected_sum) < 1e-2, "parallel broadcast sum mismatch");
+    });
+
     std::cout << tests - failures << "/" << tests << " tests passed\n";
     return failures == 0 ? 0 : 1;
 }

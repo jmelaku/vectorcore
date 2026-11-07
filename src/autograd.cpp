@@ -1,8 +1,10 @@
 #include "vectorcore/autograd.hpp"
+#include "vectorcore/cpu_backend.hpp"
 #include "vectorcore/detail/tensor_impl.hpp"
 #include "vectorcore/metal_backend.hpp"
 #include "vectorcore/ops.hpp"
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -47,32 +49,45 @@ void attach_grad_fn(Tensor& output, const std::vector<Tensor>& parents,
 
 Tensor sum_to_shape(const Tensor& gradient, const Shape& target_shape) {
     if (gradient.shape() == target_shape) return gradient;
-    if (gradient.device() == Device::metal()) {
-        auto storage = MetalBackend::instance().reduce_to_shape(
-            *gradient.impl()->storage, gradient.shape(), target_shape);
-        return make_tensor(std::move(storage), target_shape, false);
+    const auto& source = gradient.shape();
+    if (target_shape.size() > source.size()) {
+        throw std::invalid_argument("cannot reduce " + shape_string(source) + " to larger rank " +
+                                    shape_string(target_shape));
     }
-    const auto source = gradient.to_vector();
-    std::vector<float> reduced(vectorcore::numel(target_shape), 0.0F);
-    const auto target_strides = contiguous_strides(target_shape);
-    const auto& source_shape = gradient.shape();
-    const auto rank = source_shape.size();
-    for (std::size_t linear = 0; linear < source.size(); ++linear) {
-        auto remainder = linear;
-        std::size_t target_offset = 0;
-        for (std::size_t axis = rank; axis-- > 0;) {
-            const auto coordinate = source_shape[axis] == 0 ? 0 : remainder % source_shape[axis];
-            if (source_shape[axis] != 0) remainder /= source_shape[axis];
-            if (axis >= rank - target_shape.size()) {
-                const auto target_axis = axis - (rank - target_shape.size());
-                if (target_shape[target_axis] != 1) {
-                    target_offset += coordinate * target_strides[target_axis];
-                }
-            }
+    // Align the target to the source rank with leading 1s, then sum every axis
+    // where the target is 1 but the source is not, using the axis-reduction
+    // kernel (one contiguous pass per axis on either device).
+    const auto lead = source.size() - target_shape.size();
+    Tensor current = gradient;
+    for (std::size_t axis = 0; axis < source.size(); ++axis) {
+        const auto target_dim = axis < lead ? 1 : target_shape[axis - lead];
+        if (target_dim == source[axis]) continue;
+        if (target_dim != 1) {
+            throw std::invalid_argument("cannot reduce " + shape_string(source) + " to " +
+                                        shape_string(target_shape));
         }
-        reduced[target_offset] += source[linear];
+        current = vectorcore::sum(current, static_cast<std::int64_t>(axis), true);
     }
-    return Tensor(std::move(reduced), target_shape, false, Device::cpu());
+    return current.reshape(target_shape);
+}
+
+Tensor broadcast_to(const Tensor& value, const Shape& target_shape) {
+    if (value.shape() == target_shape) return value;
+    // Adding a scalar zero with an explicit output shape reuses the
+    // broadcasting kernels without materialising a ones/zeros tensor.
+    (void)broadcast_shape(value.shape(), target_shape);  // validates compatibility
+    const auto zero = Tensor::scalar(0.0F, false, value.device());
+    std::shared_ptr<Storage> storage;
+    if (value.device() == Device::cpu()) {
+        storage = make_cpu_storage(vectorcore::numel(target_shape));
+        cpu::binary(value.data(), value.shape(), value.strides(), zero.data(), {}, {},
+                    storage->mutable_data(), target_shape, cpu::BinaryOp::Add);
+    } else {
+        storage = MetalBackend::instance().binary(*value.impl()->storage, value.shape(),
+                                                  value.strides(), *zero.impl()->storage, {}, {},
+                                                  target_shape, cpu::BinaryOp::Add);
+    }
+    return make_tensor(std::move(storage), target_shape, false);
 }
 
 } // namespace detail

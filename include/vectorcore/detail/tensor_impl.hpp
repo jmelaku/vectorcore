@@ -48,5 +48,7 @@ Tensor make_tensor(std::shared_ptr<Storage> storage, Shape shape,
 void attach_grad_fn(Tensor& output, const std::vector<Tensor>& parents,
                     std::function<std::vector<Tensor>(const Tensor&)> backward);
 Tensor sum_to_shape(const Tensor& gradient, const Shape& target_shape);
+// Expand a tensor to a broadcast-compatible larger shape (not differentiable).
+Tensor broadcast_to(const Tensor& value, const Shape& target_shape);
 
 } // namespace vectorcore::detail

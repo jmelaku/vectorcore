@@ -64,44 +64,11 @@ kernel void unary(const device float* input [[buffer(0)]],
     }
 }
 
-struct ReduceShapeMeta {
-    uint rank;
-    uint target_rank;
-    uint source_count;
-    uint target_count;
-    uint source_shape[8];
-    uint target_shape[8];
-    uint target_stride[8];
-};
-
-// One thread owns each target element, so no floating-point atomics are needed.
-// This path is used for broadcast-gradient reduction; full sum uses the faster
-// parallel tree kernel below.
-kernel void reduce_to_shape(const device float* input [[buffer(0)]],
-                            device float* output [[buffer(1)]],
-                            constant ReduceShapeMeta& meta [[buffer(2)]],
-                            uint gid [[thread_position_in_grid]]) {
-    if (gid >= meta.target_count) return;
-    float accumulator = 0.0f;
-    for (uint source_linear = 0; source_linear < meta.source_count; ++source_linear) {
-        uint remainder = source_linear;
-        uint target_offset = 0;
-        for (uint reverse_axis = 0; reverse_axis < meta.rank; ++reverse_axis) {
-            uint axis = meta.rank - 1 - reverse_axis;
-            uint coordinate = remainder % meta.source_shape[axis];
-            remainder /= meta.source_shape[axis];
-            if (axis >= meta.rank - meta.target_rank) {
-                uint target_axis = axis - (meta.rank - meta.target_rank);
-                if (meta.target_shape[target_axis] != 1)
-                    target_offset += coordinate * meta.target_stride[target_axis];
-            }
-        }
-        if (target_offset == gid) accumulator += input[source_linear];
-    }
-    output[gid] = accumulator;
-}
-
 constant uint TILE = 16;
+// Specialisation constants: the host builds one matmul pipeline per
+// (TRANS_A, TRANS_B) pair, so the transpose choice costs nothing at run time.
+constant bool TRANS_A [[function_constant(0)]];
+constant bool TRANS_B [[function_constant(1)]];
 
 // Batched tiled GEMM. Threadgroup z selects the batch; offsets[z] holds the
 // element offsets of that batch's A and B matrices, which lets broadcast batch
@@ -115,6 +82,8 @@ kernel void matmul_tiled(const device float* a [[buffer(0)]],
                          const device uint2* offsets [[buffer(6)]],
                          uint3 tid [[thread_position_in_threadgroup]],
                          uint3 gid [[thread_position_in_grid]]) {
+    // TRANS_A: A is stored (k x m); TRANS_B: B is stored (n x k). Folding the
+    // transpose into the loads lets backward passes skip materialising it.
     threadgroup float tile_a[16][16];
     threadgroup float tile_b[16][16];
     const device float* batch_a = a + offsets[gid.z].x;
@@ -123,8 +92,10 @@ kernel void matmul_tiled(const device float* a [[buffer(0)]],
     for (uint tile = 0; tile < (k + TILE - 1) / TILE; ++tile) {
         uint a_col = tile * TILE + tid.x;
         uint b_row = tile * TILE + tid.y;
-        tile_a[tid.y][tid.x] = gid.y < m && a_col < k ? batch_a[gid.y * k + a_col] : 0.0f;
-        tile_b[tid.y][tid.x] = b_row < k && gid.x < n ? batch_b[b_row * n + gid.x] : 0.0f;
+        tile_a[tid.y][tid.x] = gid.y < m && a_col < k
+            ? (TRANS_A ? batch_a[a_col * m + gid.y] : batch_a[gid.y * k + a_col]) : 0.0f;
+        tile_b[tid.y][tid.x] = b_row < k && gid.x < n
+            ? (TRANS_B ? batch_b[gid.x * k + b_row] : batch_b[b_row * n + gid.x]) : 0.0f;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint inner = 0; inner < TILE; ++inner) {
             accumulator += tile_a[tid.y][inner] * tile_b[inner][tid.x];

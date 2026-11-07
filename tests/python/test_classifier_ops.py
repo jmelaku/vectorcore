@@ -184,7 +184,9 @@ def test_sgd_on_metal_matches_cpu():
 def test_metal_sgd_bumps_version_and_is_detected():
     w = vc.Tensor([[1.0], [2.0]], requires_grad=True, device="metal")
     x = vc.Tensor([[1.0, 1.0]], device="metal")
-    stale = (x @ w).sum()
+    # w * w needs the old value of w for its own gradient. (For x @ w alone,
+    # dw = x^T @ g never reads w, so mutating w would correctly not be an error.)
+    stale = (w * w).sum()
     (x @ w).sum().backward()
     before = w._version
     vc.sgd_step([w], 0.1)

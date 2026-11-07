@@ -17,8 +17,11 @@ The core does **not** call NumPy, PyTorch, Eigen, or another tensor library. Num
 - PyTorch-style safety: storage version counters reject `backward()` when a tensor saved for the gradient was modified in place (for example by `sgd_step`) after the forward pass
 - leaf-only `.grad` retention with an opt-in `retain_grad()` for intermediates; intermediate gradients are released during the backward pass
 - broadcast-gradient reduction, branched-graph accumulation, repeated backward accumulation, and CPU/Metal transfers in the graph
-- blocked, multithreaded CPU matrix multiplication
-- real Metal buffers and shaders for broadcast elementwise operations, activations, transpose, tree reduction, broadcast-gradient reduction, and tiled matrix multiplication
+- a packed, register-blocked CPU GEMM (BLIS-style panels with an 8x12 NEON FMA microkernel and a portable fallback), with transposed operands read in place so backward passes never materialise `A^T`/`B^T`
+- a persistent thread pool with dynamic chunk scheduling (which balances Apple performance and efficiency cores) used by GEMM, elementwise kernels, reductions and transpose; reductions combine fixed-size chunks in order, so results do not depend on thread count
+- elementwise fast paths for same-shape and scalar operands, and row-wise broadcasting that resolves offsets once per row instead of per element
+- real Metal buffers and shaders for broadcast elementwise operations, activations, transpose, tree and axis reductions, and batched tiled matrix multiplication (specialised per transpose combination with function constants)
+- asynchronous Metal execution: operations are encoded into shared command buffers and only waited on when the host reads values (`item()`, `to('cpu')`) or calls `vc.synchronize()`; freed buffers are recycled through a size-class pool once the GPU work that used them has completed
 - Python `Tensor`, `Linear`, MSE and cross-entropy losses, and SGD on both CPU and Metal parameters
 - deterministic linear-regression, two-layer-network, and spiral-classifier training examples
 
@@ -100,7 +103,7 @@ Run both training examples with:
 make example
 ```
 
-The checked run converged linear regression from loss `1.99738` to `6.32e-14` and learned weight `2`, bias `1`. The two-layer example reduced loss from `0.246688` to `0.005123` in 400 SGD steps. The spiral classifier (`examples/spiral_classifier.py`, three interleaved non-linearly-separable arms, 64 hidden units) reached 100% held-out accuracy in 1000 steps on both CPU (0.29 s) and Metal (14.6 s, identical loss curve); the Metal time is dominated by per-operation synchronous dispatch, see Known limitations.
+The checked run converged linear regression from loss `1.99738` to `6.32e-14` and learned weight `2`, bias `1`. The two-layer example reduced loss from `0.246688` to `0.005123` in 400 SGD steps. The spiral classifier (`examples/spiral_classifier.py`, three interleaved non-linearly-separable arms, 64 hidden units) reaches 100% held-out accuracy in 1000 steps on both CPU and Metal with identical loss curves, in about 0.2 s on either device (Metal was 14.6 s before asynchronous submission).
 
 ## Tests
 
@@ -108,14 +111,17 @@ The checked run converged linear regression from loss `1.99738` to `6.32e-14` an
 
 The final validated run on an Apple M4 passed:
 
-- C++: 22/22 cases
-- Python: 155/155 cases
-- ASan + UBSan C++ run: 22/22 cases (macOS does not provide ASan leak detection)
+- C++: 23/23 cases
+- Python: 213/213 cases
+- ASan + UBSan C++ run: 23/23 cases (macOS does not provide ASan leak detection)
+- ThreadSanitizer C++ run: 23/23 cases (covers the thread pool and Metal completion handlers)
+- Metal disabled (`-DVECTORCORE_ENABLE_METAL=OFF`): 23/23 cases
 
 ## Benchmarks
 
 ```bash
 make benchmark                         # 128, 256, 512
+PYTHONPATH=build .venv/bin/python benchmarks/train_benchmark.py   # full SGD steps
 PYTHONPATH=build .venv/bin/python benchmarks/benchmark.py --full --repeats 5
 ```
 
@@ -139,7 +145,7 @@ Inputs are created before timing; each operation receives two warmups; the media
 | 2048 | PyTorch CPU | 1.495 | 1.744 | 22.814 |
 | 2048 | PyTorch MPS | 1.498 | 1.413 | 10.930 |
 
-VectorCore is not faster than optimized vendor libraries. Its scalar broadcast index calculation limits CPU elementwise throughput, its home-grown GEMM lacks AMX/BLAS-class packing and microkernels, and the synchronous Metal design pays a command-buffer boundary per operation. The Metal backend becomes worthwhile relative to VectorCore CPU for larger work, but PyTorch MPS remains substantially faster at large GEMM. Full results and interpretation are in [benchmarks.md](docs/benchmarks.md).
+The table above predates the performance work and is kept for reference. An interleaved A/B comparison of the current kernels against the previous version (same machine, same moment) measured: CPU elementwise 19–30x faster, CPU GEMM 5–7x faster (about 460–540 GFLOP/s at 2048 when the machine is idle), CPU training steps 2–3x faster, and Metal training steps 21–31x faster thanks to asynchronous submission. Standalone Metal GEMM is unchanged. VectorCore is still not faster than vendor libraries: NumPy/PyTorch CPU use Apple's AMX-backed Accelerate GEMM, and PyTorch MPS uses Apple's tuned Metal kernels. Method, numbers and caveats are in [benchmarks.md](docs/benchmarks.md).
 
 ## Known limitations
 
@@ -147,8 +153,8 @@ VectorCore is not faster than optimized vendor libraries. Its scalar broadcast i
 - reductions accept a single axis (or all axes), not a tuple of axes.
 - `transpose` swaps the last two axes; there is no general axis permutation.
 - all operation outputs are contiguous; only reshape is a shared-storage view.
-- Metal calls are synchronous, without command fusion, allocator pooling, or asynchronous streams. Small-model training is therefore far slower on Metal than on CPU (the spiral example: ~50x), because every operation waits for its own command buffer.
-- Metal broadcast-gradient reduction favors portability and correctness over speed (one thread per target element).
+- Metal operations are not fused, and each single op still costs one command-buffer round trip when timed in isolation with a synchronize. GPU errors are reported at the next synchronization point rather than at the failing operation.
+- The Metal GEMM is a straightforward 16x16 threadgroup-tiled kernel (no simdgroup matrix instructions); PyTorch MPS is several times faster at large sizes.
 - SGD is the only optimizer (no momentum or Adam yet).
 - graphs are retained as long as output tensors reference them; there is no `retain_graph`/early-release API.
 
@@ -158,12 +164,12 @@ These constraints are explicit—the runtime does not claim unsupported kernels 
 
 ```text
 include/vectorcore/   public API and internal TensorImpl definition
-src/cpu/              CPU kernels
+src/cpu/              CPU kernels and thread pool
 src/metal/            Metal resource/dispatch implementation and non-Apple stub
 metal/                Metal Shading Language kernels
 python/               pybind11 bindings
 tests/                C++ and Python numerical/integration tests
-benchmarks/           C++ smoke benchmark and cross-framework Python harness
+benchmarks/           C++ smoke benchmark, cross-framework op harness, training-step harness
 examples/             linear regression and two-layer network
 docs/                 design and measured benchmark notes
 ```

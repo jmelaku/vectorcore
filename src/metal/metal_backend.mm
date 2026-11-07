@@ -6,11 +6,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace vectorcore {
@@ -21,10 +23,17 @@ std::string utf8(NSString* value) {
     return value ? std::string(value.UTF8String) : std::string{};
 }
 
+// Defined after MetalBackendImpl; hands a dead tensor's buffer back to the
+// pool once the GPU work that may still use it has completed.
+void release_buffer(id<MTLBuffer> buffer);
+
 class MetalStorage final : public Storage {
 public:
     MetalStorage(id<MTLBuffer> buffer, std::size_t elements)
         : buffer_(buffer), elements_(elements) {}
+    ~MetalStorage() override { release_buffer(buffer_); }
+    MetalStorage(const MetalStorage&) = delete;
+    MetalStorage& operator=(const MetalStorage&) = delete;
     [[nodiscard]] Device device() const noexcept override { return Device::metal(); }
     [[nodiscard]] std::size_t size() const noexcept override { return elements_; }
     [[nodiscard]] id<MTLBuffer> buffer() const { return buffer_; }
@@ -58,16 +67,6 @@ struct AxisMeta {
     std::uint32_t operation;
 };
 
-struct ReduceShapeMeta {
-    std::uint32_t rank{};
-    std::uint32_t target_rank{};
-    std::uint32_t source_count{};
-    std::uint32_t target_count{};
-    std::uint32_t source_shape[8]{};
-    std::uint32_t target_shape[8]{};
-    std::uint32_t target_stride[8]{};
-};
-
 std::uint32_t checked_u32(std::size_t value, const char* label) {
     if (value > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error(std::string(label) + " exceeds Metal uint range");
@@ -99,17 +98,20 @@ public:
             }
             binary_pipeline_ = pipeline(@"binary_broadcast");
             unary_pipeline_ = pipeline(@"unary");
-            matmul_pipeline_ = pipeline(@"matmul_tiled");
+            for (int variant = 0; variant < 4; ++variant) {
+                matmul_pipelines_[variant] = matmul_pipeline(variant & 1, (variant & 2) != 0);
+            }
             transpose_pipeline_ = pipeline(@"transpose_2d");
             reduce_pipeline_ = pipeline(@"reduce_sum_pass");
-            reduce_shape_pipeline_ = pipeline(@"reduce_to_shape");
             reduce_axis_pipeline_ = pipeline(@"reduce_axis");
             scatter_axis_pipeline_ = pipeline(@"scatter_axis");
             axpy_pipeline_ = pipeline(@"axpy_inplace");
-            ready_ = binary_pipeline_ && unary_pipeline_ && matmul_pipeline_ &&
-                     transpose_pipeline_ && reduce_pipeline_ && reduce_shape_pipeline_ &&
+            ready_ = binary_pipeline_ && unary_pipeline_ && matmul_pipelines_[0] &&
+                     matmul_pipelines_[1] && matmul_pipelines_[2] && matmul_pipelines_[3] &&
+                     transpose_pipeline_ && reduce_pipeline_ &&
                      reduce_axis_pipeline_ && scatter_axis_pipeline_ && axpy_pipeline_;
             if (!ready_ && error_.empty()) error_ = "one or more Metal pipelines failed to initialize";
+            backend_alive().store(true);
         }
     }
 
@@ -117,12 +119,47 @@ public:
     std::string device_name() const override { return device_ ? utf8(device_.name) : "unavailable"; }
     std::string last_error() const override { return error_; }
 
+    ~MetalBackendImpl() override {
+        // Tensors that outlive the backend (e.g. at interpreter shutdown) must
+        // not touch the pool afterwards.
+        backend_alive().store(false);
+    }
+
     std::shared_ptr<Storage> allocate(std::size_t elements) override {
         require_ready();
-        const auto bytes = std::max<std::size_t>(elements * sizeof(float), sizeof(float));
-        id<MTLBuffer> buffer = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-        if (!buffer) throw std::runtime_error("Metal buffer allocation failed");
+        const auto bytes = bucket_bytes(std::max<std::size_t>(elements * sizeof(float), sizeof(float)));
+        id<MTLBuffer> buffer = nil;
+        {
+            // Every pooled buffer is idle: it only enters the free list after
+            // the last command buffer that could reference it has completed,
+            // so the CPU may write it immediately (as upload() does).
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            auto found = free_buffers_.find(bytes);
+            if (found != free_buffers_.end() && !found->second.empty()) {
+                buffer = found->second.back();
+                found->second.pop_back();
+                pooled_bytes_ -= bytes;
+            }
+        }
+        if (!buffer) {
+            buffer = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+            if (!buffer) throw std::runtime_error("Metal buffer allocation failed");
+        }
         return std::make_shared<MetalStorage>(buffer, elements);
+    }
+
+    // Called from ~MetalStorage. The buffer may still be referenced by queued
+    // or in-flight work, so it waits in pending_release_ until the next
+    // command buffer commits, and reaches the free list from that command
+    // buffer's completion handler (the queue completes in submission order).
+    void release(id<MTLBuffer> buffer) {
+        std::lock_guard<std::mutex> lock(pool_mutex_);
+        pending_release_.push_back(buffer);
+    }
+
+    static std::atomic<bool>& backend_alive() {
+        static std::atomic<bool> alive{false};
+        return alive;
     }
 
     std::shared_ptr<Storage> upload(const float* data, std::size_t elements) override {
@@ -134,7 +171,7 @@ public:
 
     void download(const Storage& source, float* destination, std::size_t elements) override {
         if (elements > source.size()) throw std::out_of_range("Metal download exceeds storage");
-        synchronize();
+        synchronize();  // the host read must see every queued write
         if (elements) std::copy(static_cast<const float*>(as_metal(source).buffer().contents),
                                 static_cast<const float*>(as_metal(source).buffer().contents) + elements,
                                 destination);
@@ -188,7 +225,8 @@ public:
     std::shared_ptr<Storage> matmul(const Storage& a, const Storage& b,
                                     std::size_t m_size, std::size_t k_size, std::size_t n_size,
                                     const std::vector<std::size_t>& a_offsets,
-                                    const std::vector<std::size_t>& b_offsets) override {
+                                    const std::vector<std::size_t>& b_offsets,
+                                    bool trans_a, bool trans_b) override {
         if (a_offsets.size() != b_offsets.size() || a_offsets.empty()) {
             throw std::invalid_argument("Metal matmul needs one A and B offset per batch");
         }
@@ -209,7 +247,7 @@ public:
                                                           options:MTLResourceStorageModeShared];
         if (!offset_buffer) throw std::runtime_error("Metal buffer allocation failed");
         submit([&](id<MTLComputeCommandEncoder> encoder) {
-            [encoder setComputePipelineState:matmul_pipeline_];
+            [encoder setComputePipelineState:matmul_pipelines_[(trans_a ? 1 : 0) | (trans_b ? 2 : 0)]];
             [encoder setBuffer:as_metal(a).buffer() offset:0 atIndex:0];
             [encoder setBuffer:as_metal(b).buffer() offset:0 atIndex:1];
             [encoder setBuffer:as_metal(*output).buffer() offset:0 atIndex:2];
@@ -322,6 +360,7 @@ public:
             current_count = groups;
         }
         if (!owned) {
+            synchronize();  // the input may be the pending output of queued work
             auto result = allocate(1);
             std::copy(static_cast<const float*>(as_metal(input).buffer().contents),
                       static_cast<const float*>(as_metal(input).buffer().contents) + 1,
@@ -331,43 +370,56 @@ public:
         return owned;
     }
 
-    std::shared_ptr<Storage> reduce_to_shape(const Storage& input,
-                                             const Shape& input_shape,
-                                             const Shape& target_shape) override {
-        if (input_shape.size() > 8 || target_shape.size() > 8 ||
-            target_shape.size() > input_shape.size()) {
-            throw std::invalid_argument("Metal shape reduction supports compatible ranks up to 8");
-        }
-        const auto target_count = vectorcore::numel(target_shape);
-        auto output = allocate(target_count);
-        ReduceShapeMeta meta;
-        meta.rank = checked_u32(input_shape.size(), "rank");
-        meta.target_rank = checked_u32(target_shape.size(), "rank");
-        meta.source_count = checked_u32(vectorcore::numel(input_shape), "element count");
-        meta.target_count = checked_u32(target_count, "element count");
-        const auto target_strides = contiguous_strides(target_shape);
-        for (std::size_t i = 0; i < input_shape.size(); ++i) {
-            meta.source_shape[i] = checked_u32(input_shape[i], "dimension");
-        }
-        for (std::size_t i = 0; i < target_shape.size(); ++i) {
-            meta.target_shape[i] = checked_u32(target_shape[i], "dimension");
-            meta.target_stride[i] = checked_u32(target_strides[i], "stride");
-        }
-        encode_1d(reduce_shape_pipeline_, target_count,
-                  [&](id<MTLComputeCommandEncoder> encoder) {
-            [encoder setBuffer:as_metal(input).buffer() offset:0 atIndex:0];
-            [encoder setBuffer:as_metal(*output).buffer() offset:0 atIndex:1];
-            [encoder setBytes:&meta length:sizeof(meta) atIndex:2];
-        });
-        return output;
-    }
-
     void synchronize() override {
-        // Operations currently wait at submission boundaries, so this method is
-        // intentionally a no-op and remains part of the public timing contract.
+        if (!ready_) return;
+        id<MTLCommandBuffer> last = nil;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            commit_locked();
+            last = last_committed_;
+        }
+        // Command buffers on one queue complete in order, so waiting for the
+        // most recent one waits for all of them.
+        if (last) [last waitUntilCompleted];
+        // Completion handlers may run slightly after the wait returns, so
+        // check the last command buffer's status directly as well.
+        if (last && last.status == MTLCommandBufferStatusError) {
+            throw std::runtime_error("Metal command failed: " + utf8(last.error.localizedDescription));
+        }
+        {
+            // Everything submitted so far has finished: buffers released since
+            // the last commit can go straight to the free list.
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            recycle_locked(pending_release_);
+            pending_release_.clear();
+        }
+        std::string error;
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            error.swap(async_error_);
+        }
+        if (!error.empty()) throw std::runtime_error("Metal command failed: " + error);
     }
 
 private:
+    id<MTLComputePipelineState> matmul_pipeline(bool trans_a, bool trans_b) {
+        MTLFunctionConstantValues* constants = [[MTLFunctionConstantValues alloc] init];
+        [constants setConstantValue:&trans_a type:MTLDataTypeBool atIndex:0];
+        [constants setConstantValue:&trans_b type:MTLDataTypeBool atIndex:1];
+        NSError* error = nil;
+        id<MTLFunction> function = [library_ newFunctionWithName:@"matmul_tiled"
+                                                  constantValues:constants
+                                                           error:&error];
+        if (!function) {
+            error_ = "Metal matmul specialisation failed: " + utf8(error.localizedDescription);
+            return nil;
+        }
+        auto result = [device_ newComputePipelineStateWithFunction:function error:&error];
+        if (!result) error_ = "pipeline creation failed for matmul_tiled: " +
+                              utf8(error.localizedDescription);
+        return result;
+    }
+
     id<MTLComputePipelineState> pipeline(NSString* name) {
         NSError* error = nil;
         id<MTLFunction> function = [library_ newFunctionWithName:name];
@@ -385,21 +437,79 @@ private:
         if (!ready_) throw std::runtime_error("Metal backend unavailable: " + error_);
     }
 
+    // Size classes: powers of two up to 4 MiB, then 1 MiB steps, so freed
+    // buffers are reusable by similar-sized tensors with bounded waste.
+    static std::size_t bucket_bytes(std::size_t bytes) {
+        constexpr std::size_t min_bucket = 256;
+        constexpr std::size_t pow2_limit = 4U << 20;
+        constexpr std::size_t step = 1U << 20;
+        if (bytes <= min_bucket) return min_bucket;
+        if (bytes <= pow2_limit) {
+            std::size_t bucket = min_bucket;
+            while (bucket < bytes) bucket <<= 1;
+            return bucket;
+        }
+        return (bytes + step - 1) / step * step;
+    }
+
+    void recycle_locked(const std::vector<id<MTLBuffer>>& buffers) {
+        constexpr std::size_t max_pooled_bytes = 1ULL << 30;  // beyond this, let ARC free
+        for (id<MTLBuffer> buffer : buffers) {
+            const auto bytes = static_cast<std::size_t>(buffer.length);
+            if (pooled_bytes_ + bytes > max_pooled_bytes) continue;
+            free_buffers_[bytes].push_back(buffer);
+            pooled_bytes_ += bytes;
+        }
+    }
+
+    // Encode into the shared command buffer. Work is committed every
+    // kOpsPerCommandBuffer operations (so the GPU starts early) and otherwise
+    // only when the host needs results (synchronize/download). A serial
+    // compute encoder with tracked resources runs dispatches in order and
+    // makes each one's writes visible to the next.
     template <typename Configure>
     void submit(Configure configure) {
         require_ready();
         @autoreleasepool {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            id<MTLCommandBuffer> command = [queue_ commandBuffer];
-            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
-            configure(encoder);
-            [encoder endEncoding];
-            [command commit];
-            [command waitUntilCompleted];
-            if (command.status == MTLCommandBufferStatusError) {
-                throw std::runtime_error("Metal command failed: " + utf8(command.error.localizedDescription));
+            if (!current_) {
+                current_ = [queue_ commandBuffer];
+                encoder_ = [current_ computeCommandEncoder];
             }
+            configure(encoder_);
+            if (++encoded_ops_ >= kOpsPerCommandBuffer) commit_locked();
         }
+    }
+
+    void commit_locked() {
+        if (!current_) return;
+        [encoder_ endEncoding];
+        // Buffers freed before this commit may be used by this or earlier
+        // command buffers; once this one completes, all of those have too.
+        // The list stays in the backend under pool_mutex_ (not copied into the
+        // block) so the hand-off to Metal's callback thread is mutex-ordered.
+        std::uint64_t batch = 0;
+        {
+            std::lock_guard<std::mutex> lock(pool_mutex_);
+            batch = next_batch_++;
+            in_flight_[batch].swap(pending_release_);
+        }
+        auto* self = this;
+        [current_ addCompletedHandler:^(id<MTLCommandBuffer> command) {
+            std::lock_guard<std::mutex> lock(self->pool_mutex_);
+            if (command.status == MTLCommandBufferStatusError && self->async_error_.empty()) {
+                self->async_error_ = utf8(command.error.localizedDescription);
+            }
+            auto found = self->in_flight_.find(batch);
+            if (found == self->in_flight_.end()) return;
+            if (backend_alive().load()) self->recycle_locked(found->second);
+            self->in_flight_.erase(found);
+        }];
+        [current_ commit];
+        last_committed_ = current_;
+        current_ = nil;
+        encoder_ = nil;
+        encoded_ops_ = 0;
     }
 
     template <typename Configure>
@@ -420,23 +530,44 @@ private:
     id<MTLLibrary> library_;
     id<MTLComputePipelineState> binary_pipeline_;
     id<MTLComputePipelineState> unary_pipeline_;
-    id<MTLComputePipelineState> matmul_pipeline_;
+    id<MTLComputePipelineState> matmul_pipelines_[4];  // index: trans_a | trans_b << 1
     id<MTLComputePipelineState> transpose_pipeline_;
     id<MTLComputePipelineState> reduce_pipeline_;
-    id<MTLComputePipelineState> reduce_shape_pipeline_;
     id<MTLComputePipelineState> reduce_axis_pipeline_;
     id<MTLComputePipelineState> scatter_axis_pipeline_;
     id<MTLComputePipelineState> axpy_pipeline_;
+    static constexpr std::size_t kOpsPerCommandBuffer = 64;
+    id<MTLCommandBuffer> current_{nil};
+    id<MTLComputeCommandEncoder> encoder_{nil};
+    id<MTLCommandBuffer> last_committed_{nil};
+    std::size_t encoded_ops_{0};
+    std::mutex pool_mutex_;
+    std::unordered_map<std::size_t, std::vector<id<MTLBuffer>>> free_buffers_;
+    std::vector<id<MTLBuffer>> pending_release_;
+    std::unordered_map<std::uint64_t, std::vector<id<MTLBuffer>>> in_flight_;
+    std::uint64_t next_batch_{0};
+    std::size_t pooled_bytes_{0};
+    std::string async_error_;
     bool ready_{false};
     std::string error_;
     std::mutex queue_mutex_;
 };
 
-} // namespace
-
-MetalBackend& MetalBackend::instance() {
+MetalBackendImpl& backend_impl() {
     static MetalBackendImpl backend;
     return backend;
+}
+
+void release_buffer(id<MTLBuffer> buffer) {
+    if (buffer && MetalBackendImpl::backend_alive().load()) backend_impl().release(buffer);
+}
+
+} // namespace
+
+MetalBackend& MetalBackend::instance() { return backend_impl(); }
+
+void synchronize() {
+    if (MetalBackend::instance().available()) MetalBackend::instance().synchronize();
 }
 
 bool metal_available() { return MetalBackend::instance().available(); }

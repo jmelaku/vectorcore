@@ -10,11 +10,15 @@ A scalar uses an empty shape and has one element. A dimension may be zero; produ
 
 Shapes are aligned from the trailing dimension. At each axis, dimensions must match or one must equal one. CPU kernels iterate the output linear index, reconstruct coordinates, and map singleton axes to a zero input offset. Metal passes fixed-size rank/shape/stride metadata to `binary_broadcast`, which performs the same mapping in each GPU thread. Neither backend expands broadcast operands.
 
-Backward uses `sum_to_shape`: dimensions introduced by broadcasting and singleton target axes are summed. CPU performs a direct coordinate mapping. Metal executes `reduce_to_shape` on the GPU, avoiding an implicit host transfer.
+Backward uses `sum_to_shape`: the target shape is aligned to the gradient's rank, and every axis that was introduced or stretched by broadcasting is summed with the axis-reduction kernel (keepdim), followed by a reshape. Each pass is a contiguous reduction on the gradient's own device, so no host transfer is involved. The reverse expansion, `broadcast_to`, reuses the binary broadcasting kernel with a scalar zero and an explicit output shape instead of multiplying by a materialised tensor of ones.
 
 ## CPU execution
 
-Elementwise operations are direct float32 loops. Sum uses four double-precision accumulators before returning float32. Matrix multiplication is an `i-k-j` blocked kernel with 32-element tiles. For sufficiently large products, output rows are partitioned among hardware threads; no two workers write the same result element, so locks are unnecessary. This is educational systems code, not a replacement for a packed BLAS microkernel.
+A persistent thread pool (`src/cpu/parallel.cpp`) runs `parallel_for(count, grain, body)`: the range is split into fixed chunks that workers and the calling thread claim from an atomic counter, so faster performance cores naturally take more chunks than efficiency cores. Ranges at or below one grain and nested calls run inline. Because the chunk partition depends only on the range and grain, reductions that combine per-chunk partials in chunk order (full sum, for example) are deterministic regardless of thread count.
+
+Elementwise kernels dispatch the operation once (templated functors) rather than per element. Same-shape and scalar-operand cases are straight loops; general broadcasting resolves the two input offsets once per output row and then streams the last axis with a step of 0 or 1. Output buffers are allocated without zero-filling because every kernel writes its whole output.
+
+GEMM follows the BLIS/GotoBLAS structure. Operands are described by (row stride, column stride), so a transposed operand is read in place. A is packed once into 8-row slivers and B into 12-column slivers for every 256-deep panel (zero-padded at the edges). C is divided into 32x48 tiles; each parallel task owns one tile and runs all depth panels for it, so tasks never synchronise and C stays in L1. The inner 8x12 microkernel keeps 24 NEON accumulators in registers and performs 24 fused multiply-adds per depth step from two A and three B vector loads; a scalar version is used on non-ARM targets, and products below 32^3 skip packing. Matmul backward calls the kernel with transpose flags (`dA = dY @ B^T`, `dB = A^T @ dY`) and skips gradients for inputs that do not require them.
 
 ## Autograd
 
@@ -40,9 +44,13 @@ Matrix multiplication treats all but the last two axes as batch dimensions that 
 
 The build embeds `metal/kernels.metal` into the library. `MetalBackend` obtains the default device, creates one command queue, compiles the MSL source with `newLibraryWithSource`, and caches all compute pipeline states. Failure leaves the backend unavailable with a diagnostic. There is no CPU fallback inside Metal operations.
 
-Buffers use shared storage, appropriate for Apple unified memory. Upload/download still copy deliberately so tensor ownership and timing boundaries remain unambiguous. Commands are serialized through a mutex, committed, and checked after `waitUntilCompleted`.
+Buffers use shared storage, appropriate for Apple unified memory. Upload/download still copy deliberately so tensor ownership and timing boundaries remain unambiguous.
 
-The tiled GEMM kernel launches complete 16×16 threadgroups. Threads cooperatively load A and B tiles into threadgroup memory, synchronize, and accumulate one output. Complete edge threadgroups are required even when the output is smaller than a tile because otherwise K-dimension loader lanes do not exist. Sum repeatedly dispatches a 256-thread tree-reduction pass until one value remains. The current synchronous model makes correctness and timing simple, at the cost of dispatch overhead and lost overlap.
+Execution is asynchronous. Operations are encoded under a mutex into one shared compute command buffer; a serial compute encoder with hazard-tracked resources runs dispatches in order and makes each dispatch's writes visible to the next, including in-place optimizer updates. The command buffer is committed (without waiting) every 64 operations so the GPU starts early, and otherwise when the host needs data: `download`, `item()`, `to('cpu')` and `vc.synchronize()` commit and wait for the last command buffer, which on a single queue implies all earlier ones. Errors are recorded by completion handlers and by checking the last command buffer, and thrown at that synchronization point.
+
+Freed `MTLBuffer`s go through a pool. When a Metal tensor dies its buffer may still be referenced by queued or running work, so it is parked until the next commit and moves to the free list from that command buffer's completion handler; the hand-off is keyed by batch id under the pool mutex. Every buffer in the free list is therefore idle, so `allocate` may hand it to `upload` for an immediate CPU write. Size classes are powers of two up to 4 MiB and then 1 MiB steps, and the pool is capped at 1 GiB.
+
+The tiled GEMM kernel launches complete 16×16 threadgroups, with the batch index in threadgroup z and per-batch operand offsets in a buffer. Four pipelines are specialised with function constants for the (transpose A, transpose B) combinations. Threads cooperatively load A and B tiles into threadgroup memory, synchronize, and accumulate one output. Complete edge threadgroups are required even when the output is smaller than a tile because otherwise K-dimension loader lanes do not exist. Sum repeatedly dispatches a 256-thread tree-reduction pass until one value remains. Axis reductions use one thread per output element walking the reduced axis.
 
 ## Python boundary
 

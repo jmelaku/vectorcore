@@ -93,13 +93,17 @@ std::shared_ptr<Storage> reduce_storage(const Tensor& value, const AxisSplit& sp
 
 } // namespace
 
+// Backward rules compute only the gradients their inputs need (requires_grad
+// is captured at forward time); a skipped slot is ignored by the engine.
 Tensor add(const Tensor& a, const Tensor& b) {
     auto output = binary_forward(a, b, cpu::BinaryOp::Add);
     const auto a_shape = a.shape();
     const auto b_shape = b.shape();
-    detail::attach_grad_fn(output, {a, b}, [a_shape, b_shape](const Tensor& gradient) {
-        return std::vector<Tensor>{detail::sum_to_shape(gradient, a_shape),
-                                   detail::sum_to_shape(gradient, b_shape)};
+    const bool need_a = a.requires_grad();
+    const bool need_b = b.requires_grad();
+    detail::attach_grad_fn(output, {a, b}, [=](const Tensor& gradient) {
+        return std::vector<Tensor>{need_a ? detail::sum_to_shape(gradient, a_shape) : Tensor(),
+                                   need_b ? detail::sum_to_shape(gradient, b_shape) : Tensor()};
     });
     return output;
 }
@@ -108,9 +112,11 @@ Tensor subtract(const Tensor& a, const Tensor& b) {
     auto output = binary_forward(a, b, cpu::BinaryOp::Subtract);
     const auto a_shape = a.shape();
     const auto b_shape = b.shape();
-    detail::attach_grad_fn(output, {a, b}, [a_shape, b_shape](const Tensor& gradient) {
-        return std::vector<Tensor>{detail::sum_to_shape(gradient, a_shape),
-                                   detail::sum_to_shape(-gradient, b_shape)};
+    const bool need_a = a.requires_grad();
+    const bool need_b = b.requires_grad();
+    detail::attach_grad_fn(output, {a, b}, [=](const Tensor& gradient) {
+        return std::vector<Tensor>{need_a ? detail::sum_to_shape(gradient, a_shape) : Tensor(),
+                                   need_b ? detail::sum_to_shape(-gradient, b_shape) : Tensor()};
     });
     return output;
 }
@@ -119,14 +125,14 @@ Tensor multiply(const Tensor& a, const Tensor& b) {
     auto output = binary_forward(a, b, cpu::BinaryOp::Multiply);
     const auto a_shape = a.shape();
     const auto b_shape = b.shape();
+    const bool need_a = a.requires_grad();
+    const bool need_b = b.requires_grad();
     const detail::SavedTensor saved_a(a);
     const detail::SavedTensor saved_b(b);
-    detail::attach_grad_fn(output, {a, b},
-                           [saved_a, saved_b, a_shape, b_shape](const Tensor& gradient) {
-        const auto av = saved_a.unpack();
-        const auto bv = saved_b.unpack();
-        return std::vector<Tensor>{detail::sum_to_shape(gradient * bv, a_shape),
-                                   detail::sum_to_shape(gradient * av, b_shape)};
+    detail::attach_grad_fn(output, {a, b}, [=](const Tensor& gradient) {
+        return std::vector<Tensor>{
+            need_a ? detail::sum_to_shape(gradient * saved_b.unpack(), a_shape) : Tensor(),
+            need_b ? detail::sum_to_shape(gradient * saved_a.unpack(), b_shape) : Tensor()};
     });
     return output;
 }
@@ -135,14 +141,16 @@ Tensor divide(const Tensor& a, const Tensor& b) {
     auto output = binary_forward(a, b, cpu::BinaryOp::Divide);
     const auto a_shape = a.shape();
     const auto b_shape = b.shape();
+    const bool need_a = a.requires_grad();
+    const bool need_b = b.requires_grad();
     const detail::SavedTensor saved_a(a);
     const detail::SavedTensor saved_b(b);
-    detail::attach_grad_fn(output, {a, b},
-                           [saved_a, saved_b, a_shape, b_shape](const Tensor& gradient) {
-        const auto av = saved_a.unpack();
+    detail::attach_grad_fn(output, {a, b}, [=](const Tensor& gradient) {
+        std::vector<Tensor> grads{Tensor(), Tensor()};
         const auto bv = saved_b.unpack();
-        return std::vector<Tensor>{detail::sum_to_shape(gradient / bv, a_shape),
-            detail::sum_to_shape(-(gradient * av) / (bv * bv), b_shape)};
+        if (need_a) grads[0] = detail::sum_to_shape(gradient / bv, a_shape);
+        if (need_b) grads[1] = detail::sum_to_shape(-(gradient * saved_a.unpack()) / (bv * bv), b_shape);
+        return grads;
     });
     return output;
 }
@@ -155,7 +163,12 @@ Tensor negate(const Tensor& value) {
     return output;
 }
 
-Tensor matmul(const Tensor& a, const Tensor& b) {
+namespace {
+
+// op(A) @ op(B) where op transposes the last two axes when requested. The
+// transposes are folded into the kernels' indexing, so backward passes never
+// materialise A^T or B^T. Not differentiable by itself.
+Tensor matmul_kernel(const Tensor& a, const Tensor& b, bool trans_a, bool trans_b) {
     require_same_device(a, b);
     if (a.ndim() < 2 || b.ndim() < 2) {
         throw std::invalid_argument("matmul requires tensors of rank 2 or more, got " +
@@ -163,10 +176,12 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
     }
     const auto& as = a.shape();
     const auto& bs = b.shape();
-    const auto m = as[as.size() - 2];
-    const auto k = as[as.size() - 1];
-    const auto n = bs[bs.size() - 1];
-    if (bs[bs.size() - 2] != k) {
+    const auto a_rows = as[as.size() - 2], a_cols = as[as.size() - 1];
+    const auto b_rows = bs[bs.size() - 2], b_cols = bs[bs.size() - 1];
+    const auto m = trans_a ? a_cols : a_rows;
+    const auto k = trans_a ? a_rows : a_cols;
+    const auto n = trans_b ? b_rows : b_cols;
+    if ((trans_b ? b_cols : b_rows) != k) {
         throw std::invalid_argument("matmul shape mismatch: " + shape_string(as) +
                                     " and " + shape_string(bs));
     }
@@ -211,23 +226,37 @@ Tensor matmul(const Tensor& a, const Tensor& b) {
         storage = make_cpu_storage(batch * m * n);
         auto* out = storage->mutable_data();
         for (std::size_t z = 0; z < batch; ++z) {
-            cpu::matmul(a.data() + a_offsets[z], b.data() + b_offsets[z], out + z * m * n, m, k, n);
+            cpu::matmul(a.data() + a_offsets[z], b.data() + b_offsets[z], out + z * m * n,
+                        m, k, n, trans_a, trans_b);
         }
     } else {
         storage = MetalBackend::instance().matmul(*a.impl()->storage, *b.impl()->storage,
-                                                  m, k, n, a_offsets, b_offsets);
+                                                  m, k, n, a_offsets, b_offsets, trans_a, trans_b);
     }
     Shape out_shape = out_batch;
     out_shape.push_back(m);
     out_shape.push_back(n);
-    auto output = detail::make_tensor(std::move(storage), out_shape, false);
+    return detail::make_tensor(std::move(storage), out_shape, false);
+}
+
+} // namespace
+
+Tensor matmul(const Tensor& a, const Tensor& b) {
+    auto output = matmul_kernel(a, b, false, false);
     const detail::SavedTensor saved_a(a);
     const detail::SavedTensor saved_b(b);
-    detail::attach_grad_fn(output, {a, b}, [saved_a, saved_b, as, bs](const Tensor& gradient) {
-        // Batch-broadcast operands receive the sum over the broadcast batches.
+    const auto as = a.shape();
+    const auto bs = b.shape();
+    const bool need_a = a.requires_grad();
+    const bool need_b = b.requires_grad();
+    detail::attach_grad_fn(output, {a, b}, [=](const Tensor& gradient) {
+        // dA = dY @ B^T, dB = A^T @ dY; batch-broadcast operands receive the
+        // sum over the broadcast batches.
         return std::vector<Tensor>{
-            detail::sum_to_shape(gradient.matmul(saved_b.unpack().transpose()), as),
-            detail::sum_to_shape(saved_a.unpack().transpose().matmul(gradient), bs)};
+            need_a ? detail::sum_to_shape(matmul_kernel(gradient, saved_b.unpack(), false, true), as)
+                   : Tensor(),
+            need_b ? detail::sum_to_shape(matmul_kernel(saved_a.unpack(), gradient, true, false), bs)
+                   : Tensor()};
     });
     return output;
 }
@@ -243,16 +272,7 @@ Tensor transpose(const Tensor& value) {
     std::shared_ptr<Storage> storage;
     if (value.device() == Device::cpu()) {
         storage = make_cpu_storage(value.numel());
-        auto* destination = storage->mutable_data();
-        const auto* source = value.data();
-        for (std::size_t z = 0; z < batch; ++z) {
-            const auto base = z * rows * cols;
-            for (std::size_t i = 0; i < rows; ++i) {
-                for (std::size_t j = 0; j < cols; ++j) {
-                    destination[base + j * rows + i] = source[base + i * cols + j];
-                }
-            }
-        }
+        cpu::transpose(value.data(), storage->mutable_data(), batch, rows, cols);
     } else {
         storage = MetalBackend::instance().transpose_last2(*value.impl()->storage, batch, rows, cols);
     }
@@ -275,9 +295,8 @@ Tensor sum(const Tensor& value) {
     }
     auto output = detail::make_tensor(std::move(storage), {}, false);
     const auto input_shape = value.shape();
-    const auto input_device = value.device();
-    detail::attach_grad_fn(output, {value}, [input_shape, input_device](const Tensor& gradient) {
-        return std::vector<Tensor>{Tensor::ones(input_shape, false, input_device) * gradient};
+    detail::attach_grad_fn(output, {value}, [input_shape](const Tensor& gradient) {
+        return std::vector<Tensor>{detail::broadcast_to(gradient, input_shape)};
     });
     return output;
 }
@@ -288,10 +307,9 @@ Tensor sum(const Tensor& value, std::int64_t axis, bool keepdim) {
                                       keepdim ? split.kept : split.removed, false);
     const auto input_shape = value.shape();
     const auto kept = split.kept;
-    const auto device = value.device();
-    detail::attach_grad_fn(output, {value}, [input_shape, kept, device](const Tensor& gradient) {
+    detail::attach_grad_fn(output, {value}, [input_shape, kept](const Tensor& gradient) {
         // Every element along the axis contributed once: broadcast back.
-        return std::vector<Tensor>{Tensor::ones(input_shape, false, device) * gradient.reshape(kept)};
+        return std::vector<Tensor>{detail::broadcast_to(gradient.reshape(kept), input_shape)};
     });
     return output;
 }

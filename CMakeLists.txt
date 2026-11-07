@@ -18,7 +18,8 @@ set(VECTORCORE_SOURCES
     src/shape.cpp
     src/storage.cpp
     src/tensor.cpp
-    src/cpu/cpu_backend.cpp)
+    src/cpu/cpu_backend.cpp
+    src/cpu/parallel.cpp)
 
 if(APPLE AND VECTORCORE_ENABLE_METAL)
     enable_language(OBJCXX)
